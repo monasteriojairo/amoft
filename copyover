@@ -1,0 +1,6 @@
+coogineers@Coogineers:~/amoft $ ps aux | grep python
+coogine+   12569  0.0  0.0 1823424 4192 ?        Sl   01:01   0:00 /home/coogineers/.vscode-server/extensions/ms-python.vscode-python-envs-1.22.0-linux-arm64/python-env-tools/bin/pet server
+coogine+   12617  0.0  0.0 1161728 5520 ?        Sl   01:01   0:00 /home/coogineers/.vscode-server/extensions/ms-python.python-2026.4.0-linux-arm64/python-env-tools/bin/pet server
+coogine+   14561  5.0  9.7 13205024 802896 ?     Sl   01:30   0:41 /home/coogineers/.vscode-server/cli/servers/Stable-07ff9d6178ede9a1bd12ad3399074d726ebe6e43/server/node /home/coogineers/.vscode-server/extensions/ms-python.vscode-pylance-2026.1.1/dist/server.bundle.js --cancellationReceive=file:6d0436a17807bb3f4cfebdb0a36368e50103bfa9b3 --node-ipc --clientProcessId=12436
+coogine+   15260  0.2  0.7 427152 64000 pts/5    S+   01:42   0:00 python main.py
+coogine+   15326  0.0  0.0   6384  2112 pts/0    S+   01:44   0:00 grep --color=auto python
