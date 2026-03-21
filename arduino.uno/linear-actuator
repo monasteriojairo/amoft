@@ -2,16 +2,13 @@ const int EnablePin = 8;
 const int PWMPinA = 11;
 const int PWMPinB = 3;
 
-// Speed values: 0 to 255
-const int forwardSpeed =255;
+const int forwardSpeed = 255;
 const int reverseSpeed = 255;
 
-// Timing in milliseconds
-const unsigned long retractTime = 8500;
-const unsigned long extendTime  = 8500;
-const unsigned long pauseTime   = 1000;
+const unsigned long retractTime = 8000;
+const unsigned long extendTime  = 8000;
 
-bool cycleDone = false;   // tracks whether one full cycle already ran
+String command = "";
 
 void setup() {
   pinMode(EnablePin, OUTPUT);
@@ -19,27 +16,44 @@ void setup() {
   pinMode(PWMPinB, OUTPUT);
 
   stopMotor();
-  delay(1000);
+  Serial.begin(9600);
 }
 
 void loop() {
-  if (!cycleDone) {
-    // Retract
-    runReverse(reverseSpeed);
-    delay(retractTime);
+  if (Serial.available() > 0) {
+    command = Serial.readStringUntil('\n');
+    command.trim();
 
-    // Pause
-    stopMotor();
-    delay(pauseTime);
+    if (command == "EXTEND") {
+      runForward(forwardSpeed);
+      delay(extendTime);
+      stopMotor();
+      Serial.println("DONE EXTEND");
+    }
 
-    // Extend
-    runForward(forwardSpeed);
-    delay(extendTime);
+    else if (command == "RETRACT") {
+      runReverse(reverseSpeed);
+      delay(retractTime);
+      stopMotor();
+      Serial.println("DONE RETRACT");
+    }
 
-    // Final stop
-    stopMotor();
+    else if (command == "CYCLE") {
+      runReverse(reverseSpeed);
+      delay(retractTime);
+      stopMotor();
+      delay(500);
 
-    cycleDone = true;   // prevents loop from running sequence again
+      runForward(forwardSpeed);
+      delay(extendTime);
+      stopMotor();
+      Serial.println("DONE CYCLE");
+    }
+
+    else if (command == "STOP") {
+      stopMotor();
+      Serial.println("STOPPED");
+    }
   }
 }
 
