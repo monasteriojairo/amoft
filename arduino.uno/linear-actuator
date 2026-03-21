@@ -1,0 +1,62 @@
+const int EnablePin = 8;
+const int PWMPinA = 11;
+const int PWMPinB = 3;
+
+// Speed values: 0 to 255
+const int forwardSpeed =255;
+const int reverseSpeed = 255;
+
+// Timing in milliseconds
+const unsigned long retractTime = 8500;
+const unsigned long extendTime  = 8500;
+const unsigned long pauseTime   = 1000;
+
+bool cycleDone = false;   // tracks whether one full cycle already ran
+
+void setup() {
+  pinMode(EnablePin, OUTPUT);
+  pinMode(PWMPinA, OUTPUT);
+  pinMode(PWMPinB, OUTPUT);
+
+  stopMotor();
+  delay(1000);
+}
+
+void loop() {
+  if (!cycleDone) {
+    // Retract
+    runReverse(reverseSpeed);
+    delay(retractTime);
+
+    // Pause
+    stopMotor();
+    delay(pauseTime);
+
+    // Extend
+    runForward(forwardSpeed);
+    delay(extendTime);
+
+    // Final stop
+    stopMotor();
+
+    cycleDone = true;   // prevents loop from running sequence again
+  }
+}
+
+void runForward(int speedVal) {
+  digitalWrite(EnablePin, HIGH);
+  analogWrite(PWMPinA, speedVal);
+  analogWrite(PWMPinB, 0);
+}
+
+void runReverse(int speedVal) {
+  digitalWrite(EnablePin, HIGH);
+  analogWrite(PWMPinA, 0);
+  analogWrite(PWMPinB, speedVal);
+}
+
+void stopMotor() {
+  digitalWrite(EnablePin, LOW);
+  analogWrite(PWMPinA, 0);
+  analogWrite(PWMPinB, 0);
+}

@@ -3,5 +3,49 @@
     "arduino_port": "/dev/ttyUSB0",
     "baud_rate": 115200,
     "m1_enabled": false,
-    "simulation_mode": true
+    "simulation_mode": true,
+    "auto_sequences": {
+        "testcycle3": [
+            {
+                "peripheral": "m0",
+                "action": "forward",
+                "repeat": 3,
+                "dwell_ms": 3000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M0 | Forward | 3.0s | repeat 3"
+            },
+            {
+                "peripheral": "m0",
+                "action": "reverse",
+                "repeat": 1,
+                "dwell_ms": 3000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M0 | Reverse | 3.0s | repeat 1"
+            },
+            {
+                "peripheral": "m1",
+                "action": "forward",
+                "repeat": 3,
+                "dwell_ms": 3000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M1 | Forward | 3.0s | repeat 3"
+            },
+            {
+                "peripheral": "m1",
+                "action": "reverse",
+                "repeat": 1,
+                "dwell_ms": 3000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M1 | Reverse | 3.0s | repeat 1"
+            }
+        ]
+    }
 }

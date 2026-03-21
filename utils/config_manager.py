@@ -8,13 +8,17 @@ DEFAULT_CONFIG = {
     "arduino_port": "/dev/ttyUSB0",
     "baud_rate": 115200,
     "m1_enabled": False,
-    "simulation_mode": True
+    "simulation_mode": True,
+    "auto_sequences": {}
 }
 
 def load_config():
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            merged = DEFAULT_CONFIG.copy()
+            merged.update(config)
+            return merged
     return DEFAULT_CONFIG.copy()
 
 def save_config(config):

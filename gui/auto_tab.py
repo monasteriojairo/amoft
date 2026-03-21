@@ -1,89 +1,562 @@
-from PySide6.QtCore import Signal
+import time
+
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QGroupBox, QGridLayout, QPushButton,
-    QLabel, QSpinBox, QDoubleSpinBox, QProgressBar, QCheckBox
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QProgressBar,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
 )
+
+from utils.config_manager import load_config, save_config
 
 
 class AutoTab(QWidget):
     log_signal = Signal(str)
+    command_signal = Signal(str)
+    reconnect_signal = Signal()
 
     def __init__(self):
         super().__init__()
 
-        layout = QVBoxLayout(self)
+        self.sequence_steps = []
+        self.current_step_index = -1
+        self.is_running = False
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.delay_started_at = 0.0
+        self.delay_timer = QTimer(self)
+        self.delay_timer.setSingleShot(True)
+        self.delay_timer.timeout.connect(self.advance_sequence)
 
-        box = QGroupBox("Automated Cycle")
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.build_builder_group())
+        layout.addWidget(self.build_queue_group())
+        layout.addWidget(self.build_preset_group())
+
+        self.step_label = QLabel("Current Step: IDLE")
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+        layout.addWidget(self.step_label)
+        layout.addWidget(self.progress)
+
+        self.refresh_action_options()
+        self.refresh_presets()
+        self.update_button_states()
+
+    def build_builder_group(self):
+        box = QGroupBox("Step Builder")
         grid = QGridLayout(box)
 
-        self.start_btn = QPushButton("Start Cycle")
-        self.pause_btn = QPushButton("Pause")
-        self.resume_btn = QPushButton("Resume")
-        self.abort_btn = QPushButton("Abort")
-        self.reset_btn = QPushButton("Reset")
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(1, 1000)
+        self.repeat_spin.setValue(1)
+
+        self.peripheral_combo = QComboBox()
+        self.peripheral_combo.addItem("M0", "m0")
+        self.peripheral_combo.addItem("M1", "m1")
+        self.peripheral_combo.addItem("Actuator", "actuator")
+
+        self.action_combo = QComboBox()
 
         self.dwell_spin = QDoubleSpinBox()
         self.dwell_spin.setRange(0, 300)
         self.dwell_spin.setValue(5.0)
         self.dwell_spin.setSuffix(" s")
 
-        self.cycle_spin = QSpinBox()
-        self.cycle_spin.setRange(1, 1000)
-        self.cycle_spin.setValue(1)
+        self.enable_before_check = QCheckBox("Enable Motor Before Step")
+        self.stop_after_check = QCheckBox("Stop After Dwell")
+        self.disable_after_check = QCheckBox("Disable Motor After Step")
 
-        self.speed_multiplier = QDoubleSpinBox()
-        self.speed_multiplier.setRange(0.1, 5.0)
-        self.speed_multiplier.setValue(1.0)
-        self.speed_multiplier.setSingleStep(0.1)
+        self.add_step_btn = QPushButton("Add Step")
+        self.update_step_btn = QPushButton("Update Selected")
 
-        self.use_m1 = QCheckBox("Use M1")
-        self.use_actuator = QCheckBox("Use Actuator")
-        self.home_before_start = QCheckBox("Home Before Start")
+        self.peripheral_combo.currentIndexChanged.connect(self.refresh_action_options)
+        self.add_step_btn.clicked.connect(self.add_step)
+        self.update_step_btn.clicked.connect(self.update_selected_step)
 
-        self.step_label = QLabel("Current Step: IDLE")
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
+        grid.addWidget(QLabel("Repeat Count:"), 0, 0)
+        grid.addWidget(self.repeat_spin, 0, 1)
+        grid.addWidget(QLabel("Peripheral:"), 0, 2)
+        grid.addWidget(self.peripheral_combo, 0, 3)
 
-        grid.addWidget(self.start_btn, 0, 0)
-        grid.addWidget(self.pause_btn, 0, 1)
-        grid.addWidget(self.resume_btn, 0, 2)
-        grid.addWidget(self.abort_btn, 0, 3)
-        grid.addWidget(self.reset_btn, 0, 4)
+        grid.addWidget(QLabel("Action:"), 1, 0)
+        grid.addWidget(self.action_combo, 1, 1)
+        grid.addWidget(QLabel("Dwell:"), 1, 2)
+        grid.addWidget(self.dwell_spin, 1, 3)
 
-        grid.addWidget(QLabel("Dwell Time:"), 1, 0)
-        grid.addWidget(self.dwell_spin, 1, 1)
+        grid.addWidget(self.enable_before_check, 2, 0, 1, 2)
+        grid.addWidget(self.stop_after_check, 2, 2, 1, 2)
+        grid.addWidget(self.disable_after_check, 3, 0, 1, 2)
+        grid.addWidget(self.add_step_btn, 3, 2)
+        grid.addWidget(self.update_step_btn, 3, 3)
 
-        grid.addWidget(QLabel("Cycle Count:"), 1, 2)
-        grid.addWidget(self.cycle_spin, 1, 3)
+        return box
 
-        grid.addWidget(QLabel("Speed Multiplier:"), 2, 0)
-        grid.addWidget(self.speed_multiplier, 2, 1)
+    def build_queue_group(self):
+        box = QGroupBox("Sequence Queue")
+        layout = QVBoxLayout(box)
 
-        grid.addWidget(self.use_m1, 2, 2)
-        grid.addWidget(self.use_actuator, 2, 3)
-        grid.addWidget(self.home_before_start, 2, 4)
+        self.sequence_list = QListWidget()
+        self.sequence_list.currentRowChanged.connect(self.load_selected_step_into_builder)
+        self.sequence_list.currentRowChanged.connect(lambda _: self.update_button_states())
+        layout.addWidget(self.sequence_list)
 
-        grid.addWidget(self.step_label, 3, 0, 1, 5)
-        grid.addWidget(self.progress, 4, 0, 1, 5)
+        button_row = QHBoxLayout()
+        self.move_up_btn = QPushButton("Move Up")
+        self.move_down_btn = QPushButton("Move Down")
+        self.remove_btn = QPushButton("Remove")
+        self.clear_btn = QPushButton("Clear Queue")
+        self.start_btn = QPushButton("Start Queue")
+        self.pause_btn = QPushButton("Pause")
+        self.resume_btn = QPushButton("Resume")
+        self.abort_btn = QPushButton("Abort")
+        self.reset_btn = QPushButton("Reset")
+        self.reconnect_btn = QPushButton("Reconnect Link")
 
-        layout.addWidget(box)
-
+        self.move_up_btn.clicked.connect(self.move_step_up)
+        self.move_down_btn.clicked.connect(self.move_step_down)
+        self.remove_btn.clicked.connect(self.remove_selected_step)
+        self.clear_btn.clicked.connect(self.clear_queue)
         self.start_btn.clicked.connect(self.start_cycle)
-        self.pause_btn.clicked.connect(lambda: self.log_signal.emit("Auto: Pause pressed"))
-        self.resume_btn.clicked.connect(lambda: self.log_signal.emit("Auto: Resume pressed"))
-        self.abort_btn.clicked.connect(lambda: self.log_signal.emit("Auto: Abort pressed"))
+        self.pause_btn.clicked.connect(self.pause_cycle)
+        self.resume_btn.clicked.connect(self.resume_cycle)
+        self.abort_btn.clicked.connect(self.abort_cycle)
         self.reset_btn.clicked.connect(self.reset_cycle)
+        self.reconnect_btn.clicked.connect(self.request_reconnect)
 
-    def start_cycle(self):
-        self.step_label.setText("Current Step: STARTING")
-        self.progress.setValue(10)
-        self.log_signal.emit(
-            f"Auto: Start pressed | dwell={self.dwell_spin.value()}s | "
-            f"cycles={self.cycle_spin.value()} | speed x{self.speed_multiplier.value()}"
+        for button in (
+            self.move_up_btn,
+            self.move_down_btn,
+            self.remove_btn,
+            self.clear_btn,
+            self.start_btn,
+            self.pause_btn,
+            self.resume_btn,
+            self.abort_btn,
+            self.reset_btn,
+            self.reconnect_btn,
+        ):
+            button_row.addWidget(button)
+
+        layout.addLayout(button_row)
+        return box
+
+    def build_preset_group(self):
+        box = QGroupBox("Presets")
+        grid = QGridLayout(box)
+
+        self.preset_name_input = QLineEdit()
+        self.preset_combo = QComboBox()
+        self.save_preset_btn = QPushButton("Save Preset")
+        self.load_preset_btn = QPushButton("Load Preset")
+        self.delete_preset_btn = QPushButton("Delete Preset")
+
+        self.save_preset_btn.clicked.connect(self.save_preset)
+        self.load_preset_btn.clicked.connect(self.load_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_preset)
+
+        grid.addWidget(QLabel("Preset Name:"), 0, 0)
+        grid.addWidget(self.preset_name_input, 0, 1)
+        grid.addWidget(self.save_preset_btn, 0, 2)
+        grid.addWidget(QLabel("Saved Presets:"), 1, 0)
+        grid.addWidget(self.preset_combo, 1, 1)
+        grid.addWidget(self.load_preset_btn, 1, 2)
+        grid.addWidget(self.delete_preset_btn, 1, 3)
+
+        return box
+
+    def refresh_action_options(self):
+        current = self.peripheral_combo.currentData()
+        self.action_combo.clear()
+
+        if current in {"m0", "m1"}:
+            self.action_combo.addItem("Forward", "forward")
+            self.action_combo.addItem("Reverse", "reverse")
+        else:
+            self.action_combo.addItem("Extend", "extend")
+            self.action_combo.addItem("Retract", "retract")
+
+    def add_step(self):
+        step = self.build_step_from_inputs()
+        self.sequence_steps.append(step)
+        self.append_step_item(step)
+        self.sequence_list.setCurrentRow(self.sequence_list.count() - 1)
+        self.log_signal.emit(f"Auto: Added step -> {step['display']}")
+        self.update_button_states()
+
+    def update_selected_step(self):
+        row = self.sequence_list.currentRow()
+        if row < 0:
+            self.log_signal.emit("Auto: No queue step selected")
+            return
+
+        step = self.build_step_from_inputs()
+        self.sequence_steps[row] = step
+        self.sequence_list.item(row).setText(step["display"])
+        self.log_signal.emit(f"Auto: Updated step {row + 1} -> {step['display']}")
+        self.update_button_states()
+
+    def build_step_from_inputs(self):
+        peripheral = self.peripheral_combo.currentData()
+        action = self.action_combo.currentData()
+        repeat = self.repeat_spin.value()
+        dwell_s = self.dwell_spin.value()
+        dwell_ms = int(dwell_s * 1000)
+
+        display = (
+            f"{self.peripheral_combo.currentText()} | "
+            f"{self.action_combo.currentText()} | "
+            f"{dwell_s:.1f}s | repeat {repeat}"
         )
 
+        return {
+            "peripheral": peripheral,
+            "action": action,
+            "repeat": repeat,
+            "dwell_ms": dwell_ms,
+            "enable_before": self.enable_before_check.isChecked(),
+            "stop_after": self.stop_after_check.isChecked(),
+            "disable_after": self.disable_after_check.isChecked(),
+            "display": display,
+        }
+
+    def append_step_item(self, step):
+        self.sequence_list.addItem(QListWidgetItem(step["display"]))
+
+    def load_selected_step_into_builder(self, row):
+        if row < 0 or row >= len(self.sequence_steps):
+            return
+
+        step = self.sequence_steps[row]
+        self.peripheral_combo.setCurrentIndex(self.peripheral_combo.findData(step["peripheral"]))
+        self.refresh_action_options()
+        self.action_combo.setCurrentIndex(self.action_combo.findData(step["action"]))
+        self.repeat_spin.setValue(step["repeat"])
+        self.dwell_spin.setValue(step["dwell_ms"] / 1000.0)
+        self.enable_before_check.setChecked(step["enable_before"])
+        self.stop_after_check.setChecked(step["stop_after"])
+        self.disable_after_check.setChecked(step["disable_after"])
+
+    def move_step_up(self):
+        row = self.sequence_list.currentRow()
+        if row <= 0:
+            return
+        self.sequence_steps[row - 1], self.sequence_steps[row] = self.sequence_steps[row], self.sequence_steps[row - 1]
+        self.refresh_sequence_list(row - 1)
+        self.update_button_states()
+
+    def move_step_down(self):
+        row = self.sequence_list.currentRow()
+        if row < 0 or row >= len(self.sequence_steps) - 1:
+            return
+        self.sequence_steps[row + 1], self.sequence_steps[row] = self.sequence_steps[row], self.sequence_steps[row + 1]
+        self.refresh_sequence_list(row + 1)
+        self.update_button_states()
+
+    def remove_selected_step(self):
+        row = self.sequence_list.currentRow()
+        if row < 0:
+            return
+        removed = self.sequence_steps.pop(row)
+        self.sequence_list.takeItem(row)
+        self.log_signal.emit(f"Auto: Removed step -> {removed['display']}")
+        self.update_button_states()
+
+    def clear_queue(self):
+        if self.is_running:
+            self.log_signal.emit("Auto: Stop the queue before clearing it")
+            return
+        self.sequence_steps.clear()
+        self.sequence_list.clear()
+        self.step_label.setText("Current Step: IDLE")
+        self.progress.setValue(0)
+        self.log_signal.emit("Auto: Queue cleared")
+        self.update_button_states()
+
+    def refresh_sequence_list(self, selected_row):
+        self.sequence_list.clear()
+        for step in self.sequence_steps:
+            self.append_step_item(step)
+        self.sequence_list.setCurrentRow(selected_row)
+        self.update_button_states()
+
+    def save_preset(self):
+        name = self.preset_name_input.text().strip()
+        if not name:
+            self.log_signal.emit("Auto: Enter a preset name before saving")
+            return
+
+        config = load_config()
+        presets = config.setdefault("auto_sequences", {})
+        presets[name] = self.sequence_steps.copy()
+        save_config(config)
+        self.refresh_presets(name)
+        self.log_signal.emit(f"Auto: Saved preset '{name}'")
+
+    def load_preset(self):
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            self.log_signal.emit("Auto: No preset selected")
+            return
+
+        config = load_config()
+        presets = config.get("auto_sequences", {})
+        steps = presets.get(name)
+        if steps is None:
+            self.log_signal.emit(f"Auto: Preset '{name}' was not found")
+            return
+
+        self.sequence_steps = [self.normalize_loaded_step(step) for step in steps]
+        self.refresh_sequence_list(0 if self.sequence_steps else -1)
+        self.preset_name_input.setText(name)
+        self.log_signal.emit(f"Auto: Loaded preset '{name}'")
+        self.update_button_states()
+
+    def delete_preset(self):
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            return
+
+        config = load_config()
+        presets = config.get("auto_sequences", {})
+        if name in presets:
+            del presets[name]
+            config["auto_sequences"] = presets
+            save_config(config)
+            self.refresh_presets()
+            self.log_signal.emit(f"Auto: Deleted preset '{name}'")
+            self.update_button_states()
+
+    def refresh_presets(self, select_name=None):
+        config = load_config()
+        presets = sorted(config.get("auto_sequences", {}).keys())
+        self.preset_combo.clear()
+        self.preset_combo.addItems(presets)
+        if select_name:
+            index = self.preset_combo.findText(select_name)
+            if index >= 0:
+                self.preset_combo.setCurrentIndex(index)
+
+    def normalize_loaded_step(self, step):
+        normalized = {
+            "peripheral": step.get("peripheral", "m0"),
+            "action": step.get("action", "forward"),
+            "repeat": int(step.get("repeat", 1)),
+            "dwell_ms": int(step.get("dwell_ms", 1000)),
+            "enable_before": bool(step.get("enable_before", False)),
+            "stop_after": bool(step.get("stop_after", True)),
+            "disable_after": bool(step.get("disable_after", False)),
+        }
+        normalized["display"] = (
+            f"{normalized['peripheral'].upper()} | "
+            f"{normalized['action'].replace('_', ' ').title()} | "
+            f"{normalized['dwell_ms'] / 1000.0:.1f}s | repeat {normalized['repeat']}"
+        )
+        return normalized
+
+    def start_cycle(self):
+        if self.is_running:
+            self.log_signal.emit("Auto: Queue already running")
+            return
+        if not self.sequence_steps:
+            self.log_signal.emit("Auto: Add at least one step to the queue first")
+            return
+
+        self.execution_steps = self.expand_steps_for_run()
+        self.current_step_index = -1
+        self.is_running = True
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.progress.setValue(0)
+        self.step_label.setText("Current Step: STARTING")
+        self.log_signal.emit(f"Auto: Starting queued sequence with {len(self.execution_steps)} step(s)")
+        self.update_button_states()
+        self.advance_sequence()
+
+    def expand_steps_for_run(self):
+        execution = []
+        for step in self.sequence_steps:
+            for repeat_index in range(step["repeat"]):
+                execution.extend(self.execution_entries_for_step(step, repeat_index + 1))
+        return execution
+
+    def execution_entries_for_step(self, step, repeat_index):
+        entries = []
+        label_prefix = f"{step['display']} | run {repeat_index}"
+
+        if step["peripheral"] in {"m0", "m1"}:
+            motor_name = step["peripheral"].upper()
+            if step["enable_before"]:
+                entries.append({
+                    "label": f"{label_prefix} | enable",
+                    "command": f"ENABLE_{motor_name}",
+                    "delay_ms": 250,
+                })
+
+            entries.append({
+                "label": label_prefix,
+                "command": self.command_for_step(step),
+                "delay_ms": step["dwell_ms"],
+            })
+
+            if step["stop_after"]:
+                entries.append({
+                    "label": f"{label_prefix} | stop",
+                    "command": f"STOP_{motor_name}",
+                    "delay_ms": 250,
+                })
+
+            if step["disable_after"]:
+                entries.append({
+                    "label": f"{label_prefix} | disable",
+                    "command": f"DISABLE_{motor_name}",
+                    "delay_ms": 0,
+                })
+            return entries
+
+        entries.append({
+            "label": label_prefix,
+            "command": self.command_for_step(step),
+            "delay_ms": step["dwell_ms"],
+        })
+
+        if step["stop_after"]:
+            entries.append({
+                "label": f"{label_prefix} | stop",
+                "command": "STOP_ACTUATOR",
+                "delay_ms": 250,
+            })
+
+        return entries
+
+    def command_for_step(self, step):
+        if step["peripheral"] == "m0":
+            return "MOVE_POS1_M0" if step["action"] == "forward" else "MOVE_POS2_M0"
+        if step["peripheral"] == "m1":
+            return "MOVE_POS1_M1" if step["action"] == "forward" else "MOVE_POS2_M1"
+        if step["action"] == "extend":
+            return "EXTEND"
+        return "RETRACT"
+
+    def advance_sequence(self):
+        if not self.is_running or self.is_paused:
+            return
+
+        self.current_step_index += 1
+        if self.current_step_index >= len(self.execution_steps):
+            self.finish_cycle("Auto: Sequence complete")
+            return
+
+        step = self.execution_steps[self.current_step_index]
+        self.step_label.setText(f"Current Step: {step['label']}")
+        progress = int(((self.current_step_index + 1) / len(self.execution_steps)) * 100)
+        self.progress.setValue(progress)
+        self.command_signal.emit(step["command"])
+        self.log_signal.emit(f"Auto: Command sent -> {step['command']}")
+
+        if step["delay_ms"] > 0:
+            self.pending_delay_ms = step["delay_ms"]
+            self.delay_started_at = time.monotonic()
+            self.delay_timer.start(step["delay_ms"])
+        else:
+            QTimer.singleShot(0, self.advance_sequence)
+
+    def pause_cycle(self):
+        if not self.is_running or self.is_paused:
+            return
+
+        self.is_paused = True
+        if self.delay_timer.isActive():
+            elapsed_ms = int((time.monotonic() - self.delay_started_at) * 1000)
+            self.pending_delay_ms = max(0, self.pending_delay_ms - elapsed_ms)
+            self.delay_timer.stop()
+        self.step_label.setText("Current Step: PAUSED")
+        self.log_signal.emit("Auto: Pause pressed")
+        self.update_button_states()
+
+    def resume_cycle(self):
+        if not self.is_running or not self.is_paused:
+            return
+
+        self.is_paused = False
+        self.log_signal.emit("Auto: Resume pressed")
+        self.update_button_states()
+
+        if self.pending_delay_ms > 0:
+            self.delay_started_at = time.monotonic()
+            self.delay_timer.start(self.pending_delay_ms)
+        else:
+            self.advance_sequence()
+
+    def abort_cycle(self):
+        if not self.is_running:
+            self.log_signal.emit("Auto: Abort pressed")
+            return
+
+        self.delay_timer.stop()
+        self.command_signal.emit("STOP_M0")
+        self.command_signal.emit("DISABLE_M0")
+        self.command_signal.emit("STOP_M1")
+        self.command_signal.emit("DISABLE_M1")
+        self.command_signal.emit("STOP_ACTUATOR")
+
+        self.is_running = False
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.step_label.setText("Current Step: ABORTED")
+        self.progress.setValue(0)
+        self.log_signal.emit("Auto: Abort pressed")
+        self.update_button_states()
+
+    def request_reconnect(self):
+        if self.is_running:
+            self.log_signal.emit("Auto: Reconnect requested while queue is running")
+        else:
+            self.log_signal.emit("Auto: Reconnect requested")
+        self.reconnect_signal.emit()
+
     def reset_cycle(self):
+        self.delay_timer.stop()
+        self.is_running = False
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.current_step_index = -1
         self.step_label.setText("Current Step: IDLE")
         self.progress.setValue(0)
         self.log_signal.emit("Auto: Reset pressed")
+        self.update_button_states()
 
+    def finish_cycle(self, message):
+        self.is_running = False
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.step_label.setText("Current Step: COMPLETE")
+        self.progress.setValue(100)
+        self.log_signal.emit(message)
+        self.update_button_states()
+
+    def update_button_states(self):
+        selected = self.sequence_list.currentRow() >= 0
+        self.start_btn.setEnabled(not self.is_running and bool(self.sequence_steps))
+        self.pause_btn.setEnabled(self.is_running and not self.is_paused)
+        self.resume_btn.setEnabled(self.is_running and self.is_paused)
+        self.abort_btn.setEnabled(self.is_running)
+        self.reset_btn.setEnabled(not self.is_running or self.is_paused)
+        self.move_up_btn.setEnabled(not self.is_running and selected)
+        self.move_down_btn.setEnabled(not self.is_running and selected)
+        self.remove_btn.setEnabled(not self.is_running and selected)
+        self.clear_btn.setEnabled(not self.is_running and bool(self.sequence_steps))
+        self.add_step_btn.setEnabled(not self.is_running)
+        self.update_step_btn.setEnabled(not self.is_running and selected)
