@@ -12,11 +12,15 @@ String command = "";
 
 void setup() {
   pinMode(EnablePin, OUTPUT);
+  digitalWrite(EnablePin, LOW);
   pinMode(PWMPinA, OUTPUT);
+  analogWrite(PWMPinA, 0);
   pinMode(PWMPinB, OUTPUT);
+  analogWrite(PWMPinB, 0);
 
   stopMotor();
   Serial.begin(9600);
+  Serial.setTimeout(100);
 }
 
 void loop() {
@@ -53,6 +57,18 @@ void loop() {
     else if (command == "STOP") {
       stopMotor();
       Serial.println("STOPPED");
+    }
+
+    else if (command == "PING") {
+      Serial.println("PONG");
+    }
+
+    else if (command == "STATUS") {
+      Serial.println("READY");
+    }
+
+    else {
+      Serial.println("ERR UNKNOWN_CMD");
     }
   }
 }

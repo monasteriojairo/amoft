@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QLabel, QGridLayout, QComboBox
 )
 
+from controllers.arduino_controller import ArduinoController
 from controllers.clearcore_controller import ClearCoreController
 from controllers.pi_client import PiClient
 from utils.serial_ports import get_serial_ports
@@ -13,6 +14,7 @@ class ManualTab(QWidget):
     log_signal = Signal(str)
     pi_connection_signal = Signal(bool)
     clearcore_connection_signal = Signal(bool)
+    arduino_connection_signal = Signal(bool)
     m0_status_signal = Signal(str)
     m1_status_signal = Signal(str)
 
@@ -21,16 +23,23 @@ class ManualTab(QWidget):
 
         self.pi_client = PiClient(host="192.168.1.95", port=5000)
         self.clearcore_client = None
+        self.arduino_client = None
         self.pi_connected = False
         self.clearcore_connected = False
+        self.arduino_connected = False
         self.m0_enabled = False
         self.m1_enabled = False
         self.m0_widgets = []
         self.m1_widgets = []
         self.actuator_widgets = []
+        self.arduino_connection_widgets = []
+        self.arduino_diagnostic_widgets = []
         self.connection_status = None
         self.m0_state_label = None
         self.m1_state_label = None
+        self.arduino_status_label = None
+        self.arduino_diag_label = None
+        self.actuator_state_label = None
         self.last_motor_status = {"M0": "off", "M1": "off"}
 
         layout = QHBoxLayout(self)
@@ -41,6 +50,7 @@ class ManualTab(QWidget):
         left_col.addWidget(self.create_m1_group())
 
         right_col = QVBoxLayout()
+        right_col.addWidget(self.create_arduino_group())
         right_col.addWidget(self.create_actuator_group())
         right_col.addStretch()
 
@@ -120,9 +130,17 @@ class ManualTab(QWidget):
         except Exception:
             pass
 
+        try:
+            if self.arduino_client is not None:
+                self.arduino_client.disconnect()
+        except Exception:
+            pass
+
         self.clearcore_client = None
+        self.arduino_client = None
         self.set_pi_connected(False)
         self.set_clearcore_connected(False)
+        self.set_arduino_connected(False)
         self.set_motor_status("M0", "off")
         self.set_motor_status("M1", "off")
         self.status_timer.stop()
@@ -130,31 +148,28 @@ class ManualTab(QWidget):
         self.log_signal.emit("Disconnected all links")
 
     def send_command(self, cmd: str):
-        if not self.command_transport_ready():
-            self.log_signal.emit(f"Command skipped ({cmd}): no active transport")
-            return
-
         try:
-            if self.mode_combo.currentData() == "local":
-                response = self.clearcore_client.send_command(cmd)
-            else:
-                response = self.pi_client.send(cmd)
+            response = self.route_command(cmd)
 
             if self.response_has_error(response):
                 raise RuntimeError(response)
 
             self.update_motor_status_from_command(cmd)
+            self.update_actuator_status_from_command(cmd, response)
             if cmd != "PING":
                 self.refresh_motor_statuses()
 
             self.log_signal.emit(f"{cmd} -> {response}")
         except Exception as e:
-            if self.mode_combo.currentData() == "local":
+            if self.mode_combo.currentData() == "local" and not self.is_actuator_command(cmd):
                 self.clearcore_client = None
                 self.set_clearcore_connected(False)
                 self.set_motor_status("M0", "off")
                 self.set_motor_status("M1", "off")
                 self.status_timer.stop()
+            elif self.mode_combo.currentData() == "local" and self.is_actuator_command(cmd):
+                self.arduino_client = None
+                self.set_arduino_connected(False)
             elif cmd != "PING":
                 self.set_clearcore_connected(False)
                 self.set_motor_status("M0", "off")
@@ -173,10 +188,40 @@ class ManualTab(QWidget):
             return self.clearcore_connected and self.clearcore_client is not None
         return self.pi_connected
 
+    def actuator_transport_ready(self):
+        if self.mode_combo.currentData() == "local":
+            return self.arduino_connected and self.arduino_client is not None
+        return self.pi_connected
+
+    def is_actuator_command(self, cmd: str):
+        return cmd in {"EXTEND", "RETRACT", "STOP_ACTUATOR", "STOP"}
+
+    def route_command(self, cmd: str):
+        if self.is_actuator_command(cmd):
+            if not self.actuator_transport_ready():
+                raise RuntimeError("no active actuator transport")
+
+            if self.mode_combo.currentData() == "local":
+                return self.send_local_arduino_command(cmd)
+            return self.pi_client.send(cmd)
+
+        if not self.command_transport_ready():
+            raise RuntimeError("no active transport")
+
+        if self.mode_combo.currentData() == "local":
+            return self.clearcore_client.send_command(cmd)
+        return self.pi_client.send(cmd)
+
+    def send_local_arduino_command(self, cmd: str):
+        translated = "STOP" if cmd == "STOP_ACTUATOR" else cmd
+        return self.arduino_client.send_command(translated)
+
     def is_clearpath_command(self, cmd: str):
         return cmd.endswith("_M0") or cmd.endswith("_M1")
 
     def response_has_error(self, response: str):
+        if response is None:
+            return True
         return response.strip().upper().startswith("ERR")
 
     def set_pi_connected(self, connected: bool):
@@ -187,6 +232,14 @@ class ManualTab(QWidget):
     def set_clearcore_connected(self, connected: bool):
         self.clearcore_connected = connected
         self.clearcore_connection_signal.emit(connected)
+        self.update_connection_controls()
+
+    def set_arduino_connected(self, connected: bool):
+        self.arduino_connected = connected
+        self.arduino_connection_signal.emit(connected)
+        if self.arduino_status_label is not None:
+            text = "Arduino: CONNECTED" if connected else "Arduino: DISCONNECTED"
+            self.arduino_status_label.setText(text)
         self.update_connection_controls()
 
     def set_motor_status(self, motor_name: str, status: str):
@@ -231,6 +284,18 @@ class ManualTab(QWidget):
             if self.clearcore_connected:
                 enabled = self.m0_enabled if motor_name == "M0" else self.m1_enabled
                 self.set_motor_status(motor_name, "enabled" if enabled else "disabled")
+
+    def update_actuator_status_from_command(self, cmd: str, response: str):
+        if self.actuator_state_label is None or not self.is_actuator_command(cmd):
+            return
+
+        normalized = (response or "").strip().upper()
+        if cmd == "EXTEND" and normalized == "DONE EXTEND":
+            self.actuator_state_label.setText("State: EXTENDED")
+        elif cmd == "RETRACT" and normalized == "DONE RETRACT":
+            self.actuator_state_label.setText("State: RETRACTED")
+        elif cmd in {"STOP_ACTUATOR", "STOP"} and normalized == "STOPPED":
+            self.actuator_state_label.setText("State: STOPPED")
 
     def refresh_motor_statuses(self):
         if not self.command_transport_ready():
@@ -286,13 +351,17 @@ class ManualTab(QWidget):
         return mapping.get(value, "off")
 
     def update_connection_controls(self):
-        if self.mode_combo.currentData() == "local":
-            command_enabled = self.clearcore_connected
-        else:
-            command_enabled = self.pi_connected
+        clearpath_enabled = self.clearcore_connected if self.mode_combo.currentData() == "local" else self.pi_connected
+        actuator_enabled = self.arduino_connected if self.mode_combo.currentData() == "local" else self.pi_connected
 
-        for widget in self.m0_widgets + self.m1_widgets + self.actuator_widgets:
-            widget.setEnabled(command_enabled)
+        for widget in self.m0_widgets + self.m1_widgets:
+            widget.setEnabled(clearpath_enabled)
+        for widget in self.actuator_widgets:
+            widget.setEnabled(actuator_enabled)
+        for widget in self.arduino_connection_widgets:
+            widget.setEnabled(self.mode_combo.currentData() == "local")
+        for widget in self.arduino_diagnostic_widgets:
+            widget.setEnabled(self.mode_combo.currentData() == "local" and self.arduino_connected)
 
     def update_connection_label(self):
         mode = self.mode_combo.currentData()
@@ -312,12 +381,112 @@ class ManualTab(QWidget):
 
     def refresh_ports(self):
         self.port_combo.clear()
+        self.arduino_port_combo.clear()
         ports = get_serial_ports()
         for port in ports:
-            label = f"{port['device']} | {port['description']}"
+            role = self.display_role_for_port(port)
+            detail = port.get("role_detail") or port["description"]
+            label = f"{port['device']} | {role} | {detail}"
             self.port_combo.addItem(label, port["device"])
+            self.arduino_port_combo.addItem(label, port["device"])
 
-        self.log_signal.emit(f"Detected {len(ports)} serial port(s)")
+        summary = ", ".join(
+            f"{port['device']}={self.display_role_for_port(port)}" for port in ports
+        ) or "none"
+        self.log_signal.emit(f"Detected {len(ports)} serial port(s): {summary}")
+
+    def display_role_for_port(self, port_info):
+        device = port_info["device"]
+        if self.clearcore_connected and self.clearcore_client is not None and self.clearcore_client.port == device:
+            return "ClearCore (connected)"
+        if self.arduino_connected and self.arduino_client is not None and self.arduino_client.port == device:
+            return "Arduino (connected)"
+        return port_info.get("role", "Unknown")
+
+    def connect_arduino(self):
+        port = self.arduino_port_combo.currentData()
+        if not port:
+            self.log_signal.emit("Select a serial port before connecting to Arduino")
+            return
+
+        try:
+            if self.arduino_client is not None:
+                self.arduino_client.disconnect()
+
+            self.arduino_client = ArduinoController(port=port)
+            if not self.arduino_client.connect():
+                raise RuntimeError(f"Unable to open Arduino port {port}")
+
+            self.set_arduino_connected(True)
+            self.set_arduino_diag_text("Diagnostics: connected")
+            self.log_signal.emit(f"Arduino connection successful: {port}")
+        except Exception as e:
+            self.arduino_client = None
+            self.set_arduino_connected(False)
+            self.set_arduino_diag_text("Diagnostics: unavailable")
+            self.log_signal.emit(f"Arduino connection failed: {e}")
+
+    def disconnect_arduino(self):
+        try:
+            if self.arduino_client is not None:
+                self.arduino_client.disconnect()
+        except Exception as e:
+            self.log_signal.emit(f"Arduino disconnect warning: {e}")
+
+        self.arduino_client = None
+        self.set_arduino_connected(False)
+        self.set_arduino_diag_text("Diagnostics: disconnected")
+        if self.actuator_state_label is not None:
+            self.actuator_state_label.setText("State: IDLE")
+        self.log_signal.emit("Arduino disconnected")
+
+    def verify_arduino_connection(self):
+        if not self.arduino_connected or self.arduino_client is None:
+            self.log_signal.emit("Arduino verify skipped: not connected")
+            return
+
+        verified = self.arduino_client.verify_connection()
+        self.set_arduino_diag_text(f"Diagnostics: verify={'PASS' if verified else 'FAIL'}")
+        self.log_signal.emit(f"Arduino verify_connection -> {verified}")
+
+    def ping_arduino(self):
+        if not self.arduino_connected or self.arduino_client is None:
+            self.log_signal.emit("Arduino ping skipped: not connected")
+            return
+
+        response = self.arduino_client.send_command("PING")
+        self.set_arduino_diag_text(f"Diagnostics: ping={response}")
+        self.log_signal.emit(f"Arduino PING -> {response}")
+
+    def read_arduino_status(self):
+        if not self.arduino_connected or self.arduino_client is None:
+            self.log_signal.emit("Arduino status skipped: not connected")
+            return
+
+        response = self.arduino_client.status()
+        self.set_arduino_diag_text(f"Diagnostics: status={response}")
+        self.log_signal.emit(f"Arduino STATUS -> {response}")
+
+    def run_arduino_diagnostics(self):
+        if not self.arduino_connected or self.arduino_client is None:
+            self.log_signal.emit("Arduino diagnostics skipped: not connected")
+            return
+
+        diagnostics = self.arduino_client.get_diagnostics()
+        summary = (
+            f"Arduino diagnostics -> port={diagnostics['port']}, "
+            f"serial_open={diagnostics['serial_open']}, "
+            f"ping_ok={diagnostics['ping_ok']}, "
+            f"status={diagnostics['status']}"
+        )
+        self.set_arduino_diag_text(
+            f"Diagnostics: ping_ok={diagnostics['ping_ok']} status={diagnostics['status']}"
+        )
+        self.log_signal.emit(summary)
+
+    def set_arduino_diag_text(self, text: str):
+        if self.arduino_diag_label is not None:
+            self.arduino_diag_label.setText(text)
 
     def set_clearcore_port(self):
         port = self.port_combo.currentData()
@@ -363,6 +532,45 @@ class ManualTab(QWidget):
     def on_mode_changed(self):
         self.update_connection_label()
         self.log_signal.emit(f"Connection mode set to: {self.mode_combo.currentText()}")
+
+    def create_arduino_group(self):
+        box = QGroupBox("Arduino / Diagnostics")
+        grid = QGridLayout(box)
+
+        self.arduino_port_combo = QComboBox()
+        connect_btn = QPushButton("Connect Arduino")
+        disconnect_btn = QPushButton("Disconnect Arduino")
+        verify_btn = QPushButton("Verify Link")
+        ping_btn = QPushButton("Ping")
+        status_btn = QPushButton("Read Status")
+        diag_btn = QPushButton("Run Diagnostics")
+        self.arduino_status_label = QLabel("Arduino: DISCONNECTED")
+        self.arduino_diag_label = QLabel("Diagnostics: unavailable")
+
+        connect_btn.clicked.connect(self.connect_arduino)
+        disconnect_btn.clicked.connect(self.disconnect_arduino)
+        verify_btn.clicked.connect(self.verify_arduino_connection)
+        ping_btn.clicked.connect(self.ping_arduino)
+        status_btn.clicked.connect(self.read_arduino_status)
+        diag_btn.clicked.connect(self.run_arduino_diagnostics)
+
+        self.arduino_connection_widgets = [
+            self.arduino_port_combo, connect_btn, disconnect_btn
+        ]
+        self.arduino_diagnostic_widgets = [verify_btn, ping_btn, status_btn, diag_btn]
+
+        grid.addWidget(QLabel("Arduino Port:"), 0, 0)
+        grid.addWidget(self.arduino_port_combo, 0, 1, 1, 2)
+        grid.addWidget(connect_btn, 1, 0)
+        grid.addWidget(disconnect_btn, 1, 1, 1, 2)
+        grid.addWidget(verify_btn, 2, 0)
+        grid.addWidget(ping_btn, 2, 1)
+        grid.addWidget(status_btn, 2, 2)
+        grid.addWidget(diag_btn, 3, 0, 1, 3)
+        grid.addWidget(self.arduino_status_label, 4, 0, 1, 3)
+        grid.addWidget(self.arduino_diag_label, 5, 0, 1, 3)
+
+        return box
 
     def create_m0_group(self):
         box = QGroupBox("M0 - Primary Servo")
@@ -436,7 +644,7 @@ class ManualTab(QWidget):
         retract_btn = QPushButton("Retract")
         stop_btn = QPushButton("Stop")
 
-        state_label = QLabel("State: IDLE")
+        self.actuator_state_label = QLabel("State: IDLE")
         limit_label = QLabel("Limits: Unknown")
 
         self.actuator_widgets = [extend_btn, retract_btn, stop_btn]
@@ -448,7 +656,7 @@ class ManualTab(QWidget):
         layout.addWidget(extend_btn)
         layout.addWidget(retract_btn)
         layout.addWidget(stop_btn)
-        layout.addWidget(state_label)
+        layout.addWidget(self.actuator_state_label)
         layout.addWidget(limit_label)
 
         return box

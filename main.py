@@ -15,20 +15,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    
-import serial
-import time
-
-arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
-time.sleep(2)  # let Arduino reset
-
-arduino.write(b'EXTEND\n')
-response = arduino.readline().decode().strip()
-print(response)
-
-arduino.write(b'RETRACT\n')
-response = arduino.readline().decode().strip()
-print(response)
-
-arduino.close()

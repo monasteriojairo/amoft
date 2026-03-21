@@ -41,10 +41,12 @@ class MainWindow(QMainWindow):
 
         self.pi_status = StatusIndicator("PI LINK OFF")
         self.clearcore_status = StatusIndicator("CLEARCORE OFF")
+        self.arduino_status = StatusIndicator("ARDUINO OFF")
         self.m0_status = StatusIndicator("M0 OFF")
         self.m1_status = StatusIndicator("M1 OFF")
         self.statusBar().addPermanentWidget(self.pi_status)
         self.statusBar().addPermanentWidget(self.clearcore_status)
+        self.statusBar().addPermanentWidget(self.arduino_status)
         self.statusBar().addPermanentWidget(self.m0_status)
         self.statusBar().addPermanentWidget(self.m1_status)
 
@@ -55,6 +57,7 @@ class MainWindow(QMainWindow):
         self.settings_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.manual_tab.pi_connection_signal.connect(self.update_pi_status)
         self.manual_tab.clearcore_connection_signal.connect(self.update_clearcore_status)
+        self.manual_tab.arduino_connection_signal.connect(self.update_arduino_status)
         self.manual_tab.m0_status_signal.connect(self.update_m0_status)
         self.manual_tab.m1_status_signal.connect(self.update_m1_status)
 
@@ -73,6 +76,12 @@ class MainWindow(QMainWindow):
             self.clearcore_status.set_status("CLEARCORE OK", "green")
         else:
             self.clearcore_status.set_status("CLEARCORE OFF", "red")
+
+    def update_arduino_status(self, connected: bool):
+        if connected:
+            self.arduino_status.set_status("ARDUINO OK", "green")
+        else:
+            self.arduino_status.set_status("ARDUINO OFF", "red")
 
     def update_motor_indicator(self, indicator: StatusIndicator, name: str, status: str):
         if status == "enabled":
