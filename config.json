@@ -46,6 +46,68 @@
                 "disable_after": true,
                 "display": "M1 | Reverse | 3.0s | repeat 1"
             }
+        ],
+        "cycle1": [
+            {
+                "peripheral": "m0",
+                "action": "forward",
+                "repeat": 1,
+                "dwell_ms": 4000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M0 | Forward | 4.0s | repeat 1"
+            },
+            {
+                "peripheral": "actuator",
+                "action": "extend",
+                "repeat": 1,
+                "dwell_ms": 8000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "Actuator | Extend | 8.0s | repeat 1"
+            },
+            {
+                "peripheral": "actuator",
+                "action": "retract",
+                "repeat": 1,
+                "dwell_ms": 8000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "Actuator | Retract | 8.0s | repeat 1"
+            },
+            {
+                "peripheral": "m1",
+                "action": "forward",
+                "repeat": 1,
+                "dwell_ms": 4000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M1 | Forward | 4.0s | repeat 1"
+            },
+            {
+                "peripheral": "m1",
+                "action": "reverse",
+                "repeat": 1,
+                "dwell_ms": 4000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M1 | Reverse | 4.0s | repeat 1"
+            },
+            {
+                "peripheral": "m0",
+                "action": "reverse",
+                "repeat": 1,
+                "dwell_ms": 4000,
+                "enable_before": true,
+                "stop_after": false,
+                "disable_after": true,
+                "display": "M0 | Reverse | 4.0s | repeat 1"
+            }
         ]
     }
 }
