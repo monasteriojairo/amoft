@@ -6,19 +6,16 @@ const int ReachedSwitchPin = 5;
 
 const int forwardSpeed = 255;
 const int reverseSpeed = 255;
-const unsigned long motionTimeoutMs = 12000;
 
 const bool switchPressedState = LOW; // Assumes INPUT_PULLUP wiring.
 
 enum MotionState {
   MOTION_IDLE,
   MOTION_EXTENDING,
-  MOTION_RETRACTING,
-  MOTION_FAULT
+  MOTION_RETRACTING
 };
 
 MotionState motionState = MOTION_IDLE;
-unsigned long motionStartMs = 0;
 String command = "";
 
 void setup() {
@@ -84,7 +81,7 @@ void loop() {
 }
 
 void updateMotion() {
-  if (motionState == MOTION_IDLE || motionState == MOTION_FAULT) {
+  if (motionState == MOTION_IDLE) {
     return;
   }
 
@@ -100,21 +97,15 @@ void updateMotion() {
     return;
   }
 
-  if (millis() - motionStartMs > motionTimeoutMs) {
-    stopMotor();
-    motionState = MOTION_FAULT;
-  }
 }
 
 void startExtend() {
   motionState = MOTION_EXTENDING;
-  motionStartMs = millis();
   runForward(forwardSpeed);
 }
 
 void startRetract() {
   motionState = MOTION_RETRACTING;
-  motionStartMs = millis();
   runReverse(reverseSpeed);
 }
 
@@ -127,9 +118,6 @@ bool reachedSwitchPressed() {
 }
 
 String statusLine() {
-  if (motionState == MOTION_FAULT) {
-    return "STATUS_ACTUATOR:FAULT";
-  }
   if (motionState == MOTION_EXTENDING) {
     return "STATUS_ACTUATOR:EXTENDING";
   }

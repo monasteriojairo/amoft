@@ -110,9 +110,9 @@ class ManualTab(QWidget):
 
             self.clearcore_client = ClearCoreController(port=port)
             self.clearcore_client.connect()
-            self.log_signal.emit(f"ClearCore connection successful: {port}")
             self.log_clearcore_identity()
             self.set_clearcore_connected(True)
+            self.log_signal.emit(f"ClearCore connection successful: {port}")
             self.set_motor_status("M0", "disabled")
             self.set_motor_status("M1", "disabled")
 
@@ -399,17 +399,16 @@ class ManualTab(QWidget):
             self.set_actuator_limits(None, None)
 
     def log_clearcore_identity(self):
-        try:
-            version = self.clearcore_client.send_command("VERSION")
-            self.log_signal.emit(f"ClearCore firmware: {version}")
-        except Exception as e:
-            self.log_signal.emit(f"ClearCore firmware version check failed: {e}")
+        version = self.clearcore_client.send_command("VERSION")
+        caps = self.clearcore_client.send_command("CAPS")
 
-        try:
-            caps = self.clearcore_client.send_command("CAPS")
-            self.log_signal.emit(f"ClearCore capabilities: {caps}")
-        except Exception as e:
-            self.log_signal.emit(f"ClearCore capability check failed: {e}")
+        if not version.startswith("clearcore-"):
+            raise RuntimeError(f"Unexpected ClearCore VERSION response: {version!r}")
+        if not caps.startswith("CAPS:"):
+            raise RuntimeError(f"Unexpected ClearCore CAPS response: {caps!r}")
+
+        self.log_signal.emit(f"ClearCore firmware: {version}")
+        self.log_signal.emit(f"ClearCore capabilities: {caps}")
 
     def log_actuator_identity(self):
         try:
