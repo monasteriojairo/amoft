@@ -74,6 +74,8 @@ void loop() {
       Serial.println(statusLine());
     } else if (command == "LIMITS") {
       Serial.println(limitLine());
+    } else if (command == "DEBUG_ACTUATOR") {
+      Serial.println(debugLine());
     } else {
       Serial.println("ERR UNKNOWN_CMD");
     }
@@ -138,6 +140,25 @@ String limitLine() {
   line += homeSwitchPressed() ? "1" : "0";
   line += ",REACHED=";
   line += reachedSwitchPressed() ? "1" : "0";
+  return line;
+}
+
+String debugLine() {
+  String state = "IDLE";
+  if (motionState == MOTION_EXTENDING) {
+    state = "EXTENDING";
+  } else if (motionState == MOTION_RETRACTING) {
+    state = "RETRACTING";
+  }
+
+  String line = "DEBUG_ACTUATOR:STATE=";
+  line += state;
+  line += ",HOME=";
+  line += homeSwitchPressed() ? "1" : "0";
+  line += ",REACHED=";
+  line += reachedSwitchPressed() ? "1" : "0";
+  line += ",ENABLE=";
+  line += digitalRead(EnablePin) ? "1" : "0";
   return line;
 }
 

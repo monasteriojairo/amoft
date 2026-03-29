@@ -42,6 +42,7 @@ class ManualTab(QWidget):
         self.last_motor_status = {"M0": "off", "M1": "off"}
         self.last_actuator_status = "unknown"
         self.last_limit_status = {"home": None, "reached": None}
+        self.last_actuator_debug = None
 
         layout = QHBoxLayout(self)
 
@@ -237,6 +238,7 @@ class ManualTab(QWidget):
             "STOP_ACTUATOR",
             "STATUS_ACTUATOR",
             "LIMITS",
+            "DEBUG_ACTUATOR",
         }
 
     def response_has_error(self, response: str):
@@ -393,6 +395,9 @@ class ManualTab(QWidget):
             self.set_actuator_limits(home_pressed, reached_pressed)
             self.last_limit_status["home"] = home_pressed
             self.last_limit_status["reached"] = reached_pressed
+
+            debug_response = self.send_raw_command("DEBUG_ACTUATOR")
+            self.log_actuator_debug(debug_response)
         except Exception as e:
             self.log_signal.emit(f"Actuator status check failed: {e}")
             self.set_actuator_status("off")
@@ -478,6 +483,17 @@ class ManualTab(QWidget):
             values[key.strip()] = raw_value.strip() == "1"
 
         return values.get("HOME"), values.get("REACHED")
+
+    def log_actuator_debug(self, response: str):
+        normalized = response.strip().upper()
+        if not normalized.startswith("DEBUG_ACTUATOR:"):
+            raise RuntimeError(f"Unexpected debug response: {response}")
+
+        # Always log while moving; otherwise only log state changes to limit noise.
+        is_moving = "STATE=EXTENDING" in normalized or "STATE=RETRACTING" in normalized
+        if is_moving or normalized != self.last_actuator_debug:
+            self.log_signal.emit(f"Actuator debug -> {normalized}")
+        self.last_actuator_debug = normalized
 
     def update_connection_controls(self):
         motor_enabled = self.pi_connected if self.mode_combo.currentData() == "pi" else self.clearcore_connected
@@ -648,8 +664,10 @@ class ManualTab(QWidget):
 
         self.actuator_widgets = [extend_btn, retract_btn, home_btn, stop_btn]
 
-        extend_btn.clicked.connect(lambda: self.send_command("EXTEND"))
-        retract_btn.clicked.connect(lambda: self.send_command("RETRACT"))
+        extend_btn.pressed.connect(lambda: self.send_command("EXTEND"))
+        extend_btn.released.connect(lambda: self.send_command("STOP_ACTUATOR"))
+        retract_btn.pressed.connect(lambda: self.send_command("RETRACT"))
+        retract_btn.released.connect(lambda: self.send_command("STOP_ACTUATOR"))
         home_btn.clicked.connect(lambda: self.send_command("HOME"))
         stop_btn.clicked.connect(lambda: self.send_command("STOP_ACTUATOR"))
 
