@@ -3,7 +3,7 @@ import time
 
 
 class ClearCoreController:
-    def __init__(self, port="/dev/ttyACM1", baudrate=115200, timeout=1.0):
+    def __init__(self, port="/dev/ttyACM1", baudrate=9600, timeout=1.0):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout

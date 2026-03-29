@@ -1,13 +1,24 @@
 const int EnablePin = 8;
 const int PWMPinA = 11;
 const int PWMPinB = 3;
+const int HomeSwitchPin = 4;
+const int ReachedSwitchPin = 5;
 
 const int forwardSpeed = 255;
 const int reverseSpeed = 255;
+const unsigned long motionTimeoutMs = 12000;
 
-const unsigned long retractTime = 8000;
-const unsigned long extendTime  = 8000;
+const bool switchPressedState = LOW; // Assumes INPUT_PULLUP wiring.
 
+enum MotionState {
+  MOTION_IDLE,
+  MOTION_EXTENDING,
+  MOTION_RETRACTING,
+  MOTION_FAULT
+};
+
+MotionState motionState = MOTION_IDLE;
+unsigned long motionStartMs = 0;
 String command = "";
 
 void setup() {
@@ -17,60 +28,129 @@ void setup() {
   analogWrite(PWMPinA, 0);
   pinMode(PWMPinB, OUTPUT);
   analogWrite(PWMPinB, 0);
+  pinMode(HomeSwitchPin, INPUT_PULLUP);
+  pinMode(ReachedSwitchPin, INPUT_PULLUP);
 
   stopMotor();
   Serial.begin(9600);
   Serial.setTimeout(100);
+  Serial.println("READY");
 }
 
 void loop() {
+  updateMotion();
+
   if (Serial.available() > 0) {
     command = Serial.readStringUntil('\n');
     command.trim();
+    command.toUpperCase();
 
-    if (command == "EXTEND") {
-      runForward(forwardSpeed);
-      delay(extendTime);
-      stopMotor();
-      Serial.println("DONE EXTEND");
-    }
-
-    else if (command == "RETRACT") {
-      runReverse(reverseSpeed);
-      delay(retractTime);
-      stopMotor();
-      Serial.println("DONE RETRACT");
-    }
-
-    else if (command == "CYCLE") {
-      runReverse(reverseSpeed);
-      delay(retractTime);
-      stopMotor();
-      delay(500);
-
-      runForward(forwardSpeed);
-      delay(extendTime);
-      stopMotor();
-      Serial.println("DONE CYCLE");
-    }
-
-    else if (command == "STOP") {
-      stopMotor();
-      Serial.println("STOPPED");
-    }
-
-    else if (command == "PING") {
+    if (command == "PING") {
       Serial.println("PONG");
-    }
-
-    else if (command == "STATUS") {
-      Serial.println("READY");
-    }
-
-    else {
+    } else if (command == "VERSION") {
+      Serial.println("linear-actuator-limit-v1");
+    } else if (command == "CAPS") {
+      Serial.println("CAPS:ACTUATOR,STATUS,LIMITS,HOME");
+    } else if (command == "EXTEND") {
+      if (reachedSwitchPressed()) {
+        stopMotor();
+        motionState = MOTION_IDLE;
+        Serial.println("OK EXTEND AT_REACHED");
+      } else {
+        startExtend();
+        Serial.println("OK EXTEND");
+      }
+    } else if (command == "RETRACT" || command == "HOME") {
+      if (homeSwitchPressed()) {
+        stopMotor();
+        motionState = MOTION_IDLE;
+        Serial.println(command == "HOME" ? "OK HOME AT_HOME" : "OK RETRACT AT_HOME");
+      } else {
+        startRetract();
+        Serial.println(command == "HOME" ? "OK HOME" : "OK RETRACT");
+      }
+    } else if (command == "STOP" || command == "STOP_ACTUATOR") {
+      stopMotor();
+      motionState = MOTION_IDLE;
+      Serial.println("OK STOP");
+    } else if (command == "STATUS_ACTUATOR") {
+      Serial.println(statusLine());
+    } else if (command == "LIMITS") {
+      Serial.println(limitLine());
+    } else {
       Serial.println("ERR UNKNOWN_CMD");
     }
   }
+}
+
+void updateMotion() {
+  if (motionState == MOTION_IDLE || motionState == MOTION_FAULT) {
+    return;
+  }
+
+  if (motionState == MOTION_EXTENDING && reachedSwitchPressed()) {
+    stopMotor();
+    motionState = MOTION_IDLE;
+    return;
+  }
+
+  if (motionState == MOTION_RETRACTING && homeSwitchPressed()) {
+    stopMotor();
+    motionState = MOTION_IDLE;
+    return;
+  }
+
+  if (millis() - motionStartMs > motionTimeoutMs) {
+    stopMotor();
+    motionState = MOTION_FAULT;
+  }
+}
+
+void startExtend() {
+  motionState = MOTION_EXTENDING;
+  motionStartMs = millis();
+  runForward(forwardSpeed);
+}
+
+void startRetract() {
+  motionState = MOTION_RETRACTING;
+  motionStartMs = millis();
+  runReverse(reverseSpeed);
+}
+
+bool homeSwitchPressed() {
+  return digitalRead(HomeSwitchPin) == switchPressedState;
+}
+
+bool reachedSwitchPressed() {
+  return digitalRead(ReachedSwitchPin) == switchPressedState;
+}
+
+String statusLine() {
+  if (motionState == MOTION_FAULT) {
+    return "STATUS_ACTUATOR:FAULT";
+  }
+  if (motionState == MOTION_EXTENDING) {
+    return "STATUS_ACTUATOR:EXTENDING";
+  }
+  if (motionState == MOTION_RETRACTING) {
+    return "STATUS_ACTUATOR:RETRACTING";
+  }
+  if (homeSwitchPressed()) {
+    return "STATUS_ACTUATOR:AT_HOME";
+  }
+  if (reachedSwitchPressed()) {
+    return "STATUS_ACTUATOR:AT_REACHED";
+  }
+  return "STATUS_ACTUATOR:IDLE";
+}
+
+String limitLine() {
+  String line = "LIMITS:HOME=";
+  line += homeSwitchPressed() ? "1" : "0";
+  line += ",REACHED=";
+  line += reachedSwitchPressed() ? "1" : "0";
+  return line;
 }
 
 void runForward(int speedVal) {
