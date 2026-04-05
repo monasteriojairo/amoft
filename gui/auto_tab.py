@@ -52,6 +52,7 @@ class AutoTab(QWidget):
         layout.addWidget(self.progress)
 
         self.refresh_action_options()
+        self.update_step_option_controls()
         self.refresh_presets()
         self.update_button_states()
 
@@ -64,8 +65,8 @@ class AutoTab(QWidget):
         self.repeat_spin.setValue(1)
 
         self.peripheral_combo = QComboBox()
-        self.peripheral_combo.addItem("M0", "m0")
-        self.peripheral_combo.addItem("M1", "m1")
+        self.peripheral_combo.addItem("M0 | Roll Servo", "m0")
+        self.peripheral_combo.addItem("M1 | Tilt Servo", "m1")
         self.peripheral_combo.addItem("Actuator", "actuator")
 
         self.action_combo = QComboBox()
@@ -82,7 +83,7 @@ class AutoTab(QWidget):
         self.add_step_btn = QPushButton("Add Step")
         self.update_step_btn = QPushButton("Update Selected")
 
-        self.peripheral_combo.currentIndexChanged.connect(self.refresh_action_options)
+        self.peripheral_combo.currentIndexChanged.connect(self.on_peripheral_changed)
         self.add_step_btn.clicked.connect(self.add_step)
         self.update_step_btn.clicked.connect(self.update_selected_step)
 
@@ -188,6 +189,34 @@ class AutoTab(QWidget):
             self.action_combo.addItem("Extend", "extend")
             self.action_combo.addItem("Retract", "retract")
 
+    def on_peripheral_changed(self):
+        self.refresh_action_options()
+        self.update_step_option_controls()
+
+    def update_step_option_controls(self):
+        peripheral = self.peripheral_combo.currentData()
+        is_motor = peripheral in {"m0", "m1"}
+        is_actuator = peripheral == "actuator"
+
+        self.enable_before_check.setText("Enable Motor Before Step")
+        self.stop_after_check.setText("Stop After Dwell")
+        self.disable_after_check.setText("Disable Motor After Step")
+
+        if is_motor:
+            self.enable_before_check.setChecked(True)
+            self.stop_after_check.setChecked(True)
+            self.disable_after_check.setChecked(True)
+        elif is_actuator:
+            self.enable_before_check.setText("Start Actuator Before Step")
+            self.disable_after_check.setText("Stop Actuator After Step")
+            self.enable_before_check.setChecked(True)
+            self.stop_after_check.setChecked(False)
+            self.disable_after_check.setChecked(True)
+
+        self.enable_before_check.setEnabled(False if (is_motor or is_actuator) else True)
+        self.stop_after_check.setEnabled(not is_actuator)
+        self.disable_after_check.setEnabled(False if (is_motor or is_actuator) else True)
+
     def add_step(self):
         step = self.build_step_from_inputs()
         self.sequence_steps.append(step)
@@ -226,9 +255,9 @@ class AutoTab(QWidget):
             "action": action,
             "repeat": repeat,
             "dwell_ms": dwell_ms,
-            "enable_before": self.enable_before_check.isChecked(),
-            "stop_after": self.stop_after_check.isChecked(),
-            "disable_after": self.disable_after_check.isChecked(),
+            "enable_before": True if peripheral in {"m0", "m1", "actuator"} else self.enable_before_check.isChecked(),
+            "stop_after": False if peripheral == "actuator" else self.stop_after_check.isChecked(),
+            "disable_after": True if peripheral in {"m0", "m1", "actuator"} else self.disable_after_check.isChecked(),
             "display": display,
         }
 
@@ -241,13 +270,13 @@ class AutoTab(QWidget):
 
         step = self.sequence_steps[row]
         self.peripheral_combo.setCurrentIndex(self.peripheral_combo.findData(step["peripheral"]))
-        self.refresh_action_options()
         self.action_combo.setCurrentIndex(self.action_combo.findData(step["action"]))
         self.repeat_spin.setValue(step["repeat"])
         self.dwell_spin.setValue(step["dwell_ms"] / 1000.0)
         self.enable_before_check.setChecked(step["enable_before"])
         self.stop_after_check.setChecked(step["stop_after"])
         self.disable_after_check.setChecked(step["disable_after"])
+        self.update_step_option_controls()
 
     def move_step_up(self):
         row = self.sequence_list.currentRow()
@@ -359,6 +388,14 @@ class AutoTab(QWidget):
             "stop_after": bool(step.get("stop_after", True)),
             "disable_after": bool(step.get("disable_after", False)),
         }
+        if normalized["peripheral"] in {"m0", "m1"}:
+            normalized["enable_before"] = True
+            normalized["stop_after"] = True
+            normalized["disable_after"] = True
+        elif normalized["peripheral"] == "actuator":
+            normalized["enable_before"] = True
+            normalized["stop_after"] = False
+            normalized["disable_after"] = True
         normalized["display"] = (
             f"{normalized['peripheral'].upper()} | "
             f"{normalized['action'].replace('_', ' ').title()} | "
@@ -398,12 +435,11 @@ class AutoTab(QWidget):
 
         if step["peripheral"] in {"m0", "m1"}:
             motor_name = step["peripheral"].upper()
-            if step["enable_before"]:
-                entries.append({
-                    "label": f"{label_prefix} | enable",
-                    "command": f"ENABLE_{motor_name}",
-                    "delay_ms": 250,
-                })
+            entries.append({
+                "label": f"{label_prefix} | enable",
+                "command": f"ENABLE_{motor_name}",
+                "delay_ms": 250,
+            })
 
             entries.append({
                 "label": label_prefix,
@@ -418,12 +454,11 @@ class AutoTab(QWidget):
                     "delay_ms": 250,
                 })
 
-            if step["disable_after"]:
-                entries.append({
-                    "label": f"{label_prefix} | disable",
-                    "command": f"DISABLE_{motor_name}",
-                    "delay_ms": 0,
-                })
+            entries.append({
+                "label": f"{label_prefix} | disable",
+                "command": f"DISABLE_{motor_name}",
+                "delay_ms": 0,
+            })
             return entries
 
         entries.append({
@@ -432,7 +467,7 @@ class AutoTab(QWidget):
             "delay_ms": step["dwell_ms"],
         })
 
-        if step["stop_after"]:
+        if step["disable_after"]:
             entries.append({
                 "label": f"{label_prefix} | stop",
                 "command": "STOP_ACTUATOR",

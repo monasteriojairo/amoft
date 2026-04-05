@@ -18,6 +18,9 @@ def classify_serial_port(device: str, timeout: float = 0.6):
 
             ping_response = send_probe_command(connection, "PING")
             caps_response = send_probe_command(connection, "CAPS")
+            if caps_response == "CAPS:ACTUATOR":
+                return "Arduino", f"PING={ping_response or 'none'}, CAPS={caps_response}"
+
             if caps_response.startswith("CAPS:"):
                 return "ClearCore", f"PING={ping_response or 'none'}, CAPS={caps_response}"
 

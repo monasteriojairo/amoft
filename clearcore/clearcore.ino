@@ -86,6 +86,8 @@ String HandleCommand(const String &rawCmd) {
     cmd.toUpperCase();
 
     if (cmd == "PING") return "PONG";
+    if (cmd == "PING_M0") return "PONG_M0";
+    if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
     if (cmd == "CAPS") return "CAPS:M0,M1,STATUS";
     if (cmd == "ENABLE_M0") return EnableMotorM0() ? "OK ENABLE_M0" : "ERR ENABLE_M0";

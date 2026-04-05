@@ -7,8 +7,22 @@ const int reverseSpeed = 255;
 
 const unsigned long retractTime = 8000;
 const unsigned long extendTime  = 8000;
+const unsigned long cyclePauseTime = 500;
 
 String command = "";
+
+enum MotionState {
+  IDLE,
+  EXTENDING,
+  RETRACTING,
+  CYCLE_RETRACTING,
+  CYCLE_PAUSE,
+  CYCLE_EXTENDING
+};
+
+MotionState motionState = IDLE;
+unsigned long motionStartedAt = 0;
+unsigned long pauseStartedAt = 0;
 
 void setup() {
   pinMode(EnablePin, OUTPUT);
@@ -24,38 +38,30 @@ void setup() {
 }
 
 void loop() {
+  updateMotion();
+
   if (Serial.available() > 0) {
     command = Serial.readStringUntil('\n');
     command.trim();
 
     if (command == "EXTEND") {
-      runForward(forwardSpeed);
-      delay(extendTime);
-      stopMotor();
-      Serial.println("DONE EXTEND");
+      startExtend();
+      Serial.println("STARTED EXTEND");
     }
 
     else if (command == "RETRACT") {
-      runReverse(reverseSpeed);
-      delay(retractTime);
-      stopMotor();
-      Serial.println("DONE RETRACT");
+      startRetract();
+      Serial.println("STARTED RETRACT");
     }
 
     else if (command == "CYCLE") {
-      runReverse(reverseSpeed);
-      delay(retractTime);
-      stopMotor();
-      delay(500);
-
-      runForward(forwardSpeed);
-      delay(extendTime);
-      stopMotor();
-      Serial.println("DONE CYCLE");
+      startCycle();
+      Serial.println("STARTED CYCLE");
     }
 
-    else if (command == "STOP") {
+    else if (command == "STOP" || command == "STOP_ACTUATOR") {
       stopMotor();
+      motionState = IDLE;
       Serial.println("STOPPED");
     }
 
@@ -64,12 +70,80 @@ void loop() {
     }
 
     else if (command == "STATUS") {
-      Serial.println("READY");
+      Serial.println(currentStatus());
+    }
+
+    else if (command == "CAPS") {
+      Serial.println("CAPS:ACTUATOR");
     }
 
     else {
       Serial.println("ERR UNKNOWN_CMD");
     }
+  }
+}
+
+void startExtend() {
+  runForward(forwardSpeed);
+  motionState = EXTENDING;
+  motionStartedAt = millis();
+}
+
+void startRetract() {
+  runReverse(reverseSpeed);
+  motionState = RETRACTING;
+  motionStartedAt = millis();
+}
+
+void startCycle() {
+  runReverse(reverseSpeed);
+  motionState = CYCLE_RETRACTING;
+  motionStartedAt = millis();
+}
+
+void updateMotion() {
+  unsigned long now = millis();
+
+  if (motionState == EXTENDING && now - motionStartedAt >= extendTime) {
+    stopMotor();
+    motionState = IDLE;
+    Serial.println("DONE EXTEND");
+  }
+  else if (motionState == RETRACTING && now - motionStartedAt >= retractTime) {
+    stopMotor();
+    motionState = IDLE;
+    Serial.println("DONE RETRACT");
+  }
+  else if (motionState == CYCLE_RETRACTING && now - motionStartedAt >= retractTime) {
+    stopMotor();
+    motionState = CYCLE_PAUSE;
+    pauseStartedAt = now;
+  }
+  else if (motionState == CYCLE_PAUSE && now - pauseStartedAt >= cyclePauseTime) {
+    runForward(forwardSpeed);
+    motionState = CYCLE_EXTENDING;
+    motionStartedAt = now;
+  }
+  else if (motionState == CYCLE_EXTENDING && now - motionStartedAt >= extendTime) {
+    stopMotor();
+    motionState = IDLE;
+    Serial.println("DONE CYCLE");
+  }
+}
+
+const char *currentStatus() {
+  switch (motionState) {
+    case EXTENDING:
+      return "EXTENDING";
+    case RETRACTING:
+      return "RETRACTING";
+    case CYCLE_RETRACTING:
+    case CYCLE_PAUSE:
+    case CYCLE_EXTENDING:
+      return "CYCLING";
+    case IDLE:
+    default:
+      return "READY";
   }
 }
 

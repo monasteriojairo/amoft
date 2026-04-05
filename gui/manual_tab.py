@@ -65,6 +65,11 @@ class ManualTab(QWidget):
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(1500)
         self.status_timer.timeout.connect(self.refresh_motor_statuses)
+        self.auto_retry_timer = QTimer(self)
+        self.auto_retry_timer.setInterval(5000)
+        self.auto_retry_timer.timeout.connect(self.auto_retry_devices)
+        self.update_auto_retry_timer()
+        QTimer.singleShot(0, self.auto_connect_startup_devices)
 
     def connect_selected_mode(self):
         mode = self.mode_combo.currentData()
@@ -90,10 +95,18 @@ class ManualTab(QWidget):
             self.log_signal.emit(f"Pi connection failed: {e}")
             self.update_connection_label()
 
-    def connect_local_clearcore(self):
+    def connect_local_clearcore(self, quiet: bool = False):
         port = self.port_combo.currentData()
         if not port:
-            self.log_signal.emit("Select a serial port before connecting to ClearCore")
+            if not quiet:
+                self.log_signal.emit("Select a serial port before connecting to ClearCore")
+            return
+
+        if self.arduino_connected and self.arduino_client is not None and self.arduino_client.port == port:
+            if not quiet:
+                self.log_signal.emit(
+                    f"ClearCore connect blocked: {port} is already assigned to Arduino"
+                )
             return
 
         try:
@@ -115,7 +128,8 @@ class ManualTab(QWidget):
             self.set_motor_status("M0", "off")
             self.set_motor_status("M1", "off")
             self.status_timer.stop()
-            self.log_signal.emit(f"ClearCore connection failed: {e}")
+            if not quiet:
+                self.log_signal.emit(f"ClearCore connection failed: {e}")
             self.update_connection_label()
 
     def disconnect_all(self):
@@ -227,11 +241,14 @@ class ManualTab(QWidget):
     def set_pi_connected(self, connected: bool):
         self.pi_connected = connected
         self.pi_connection_signal.emit(connected)
+        self.update_auto_retry_timer()
         self.update_connection_controls()
 
     def set_clearcore_connected(self, connected: bool):
         self.clearcore_connected = connected
         self.clearcore_connection_signal.emit(connected)
+        self.refresh_port_labels()
+        self.update_auto_retry_timer()
         self.update_connection_controls()
 
     def set_arduino_connected(self, connected: bool):
@@ -240,6 +257,8 @@ class ManualTab(QWidget):
         if self.arduino_status_label is not None:
             text = "Arduino: CONNECTED" if connected else "Arduino: DISCONNECTED"
             self.arduino_status_label.setText(text)
+        self.refresh_port_labels()
+        self.update_auto_retry_timer()
         self.update_connection_controls()
 
     def set_motor_status(self, motor_name: str, status: str):
@@ -290,10 +309,18 @@ class ManualTab(QWidget):
             return
 
         normalized = (response or "").strip().upper()
-        if cmd == "EXTEND" and normalized == "DONE EXTEND":
-            self.actuator_state_label.setText("State: EXTENDED")
-        elif cmd == "RETRACT" and normalized == "DONE RETRACT":
-            self.actuator_state_label.setText("State: RETRACTED")
+        if cmd == "EXTEND" and normalized in {"STARTED EXTEND", "DONE EXTEND"}:
+            self.actuator_state_label.setText("State: EXTENDING")
+            if normalized == "DONE EXTEND":
+                self.actuator_state_label.setText("State: EXTENDED")
+        elif cmd == "RETRACT" and normalized in {"STARTED RETRACT", "DONE RETRACT"}:
+            self.actuator_state_label.setText("State: RETRACTING")
+            if normalized == "DONE RETRACT":
+                self.actuator_state_label.setText("State: RETRACTED")
+        elif cmd == "CYCLE" and normalized in {"STARTED CYCLE", "DONE CYCLE"}:
+            self.actuator_state_label.setText("State: CYCLING")
+            if normalized == "DONE CYCLE":
+                self.actuator_state_label.setText("State: IDLE")
         elif cmd in {"STOP_ACTUATOR", "STOP"} and normalized == "STOPPED":
             self.actuator_state_label.setText("State: STOPPED")
 
@@ -379,10 +406,11 @@ class ManualTab(QWidget):
 
         self.update_connection_controls()
 
-    def refresh_ports(self):
+    def refresh_ports(self, quiet: bool = False):
         self.port_combo.clear()
         self.arduino_port_combo.clear()
         ports = get_serial_ports()
+        self.available_ports = ports
         for port in ports:
             role = self.display_role_for_port(port)
             detail = port.get("role_detail") or port["description"]
@@ -390,23 +418,137 @@ class ManualTab(QWidget):
             self.port_combo.addItem(label, port["device"])
             self.arduino_port_combo.addItem(label, port["device"])
 
-        summary = ", ".join(
-            f"{port['device']}={self.display_role_for_port(port)}" for port in ports
-        ) or "none"
-        self.log_signal.emit(f"Detected {len(ports)} serial port(s): {summary}")
+        if not quiet:
+            summary = ", ".join(
+                f"{port['device']}={self.display_role_for_port(port)}" for port in ports
+            ) or "none"
+            self.log_signal.emit(f"Detected {len(ports)} serial port(s): {summary}")
+
+    def refresh_port_labels(self):
+        if not hasattr(self, "port_combo") or not hasattr(self, "arduino_port_combo"):
+            return
+
+        clearcore_selected = self.port_combo.currentData()
+        arduino_selected = self.arduino_port_combo.currentData()
+
+        self.port_combo.blockSignals(True)
+        self.arduino_port_combo.blockSignals(True)
+
+        self.port_combo.clear()
+        self.arduino_port_combo.clear()
+
+        for port in getattr(self, "available_ports", []):
+            role = self.display_role_for_port(port)
+            detail = port.get("role_detail") or port["description"]
+            label = f"{port['device']} | {role} | {detail}"
+            self.port_combo.addItem(label, port["device"])
+            self.arduino_port_combo.addItem(label, port["device"])
+
+        if clearcore_selected is not None:
+            index = self.port_combo.findData(clearcore_selected)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+
+        if arduino_selected is not None:
+            index = self.arduino_port_combo.findData(arduino_selected)
+            if index >= 0:
+                self.arduino_port_combo.setCurrentIndex(index)
+
+        self.port_combo.blockSignals(False)
+        self.arduino_port_combo.blockSignals(False)
+
+    def auto_connect_startup_devices(self):
+        if self.mode_combo.currentData() != "local":
+            return
+
+        self.refresh_ports(quiet=True)
+        clearcore_port = self.find_preferred_port("ClearCore")
+        arduino_port = self.find_preferred_port("Arduino", exclude_devices={clearcore_port} if clearcore_port else None)
+
+        if clearcore_port:
+            index = self.port_combo.findData(clearcore_port)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+            self.log_signal.emit(f"Startup auto-connect: trying ClearCore on {clearcore_port}")
+            self.connect_local_clearcore()
+        else:
+            self.log_signal.emit("Startup auto-connect: no ClearCore port detected")
+
+        if arduino_port:
+            index = self.arduino_port_combo.findData(arduino_port)
+            if index >= 0:
+                self.arduino_port_combo.setCurrentIndex(index)
+            self.log_signal.emit(f"Startup auto-connect: trying Arduino on {arduino_port}")
+            self.connect_arduino()
+        else:
+            self.log_signal.emit("Startup auto-connect: no Arduino port detected")
+
+    def auto_retry_devices(self):
+        if self.mode_combo.currentData() != "local":
+            return
+
+        self.refresh_ports(quiet=True)
+
+        if not self.clearcore_connected:
+            clearcore_port = self.find_preferred_port("ClearCore")
+            if clearcore_port:
+                index = self.port_combo.findData(clearcore_port)
+                if index >= 0:
+                    self.port_combo.setCurrentIndex(index)
+                self.connect_local_clearcore(quiet=True)
+
+        if not self.arduino_connected:
+            exclude_devices = {self.clearcore_client.port} if self.clearcore_connected and self.clearcore_client is not None else None
+            arduino_port = self.find_preferred_port("Arduino", exclude_devices=exclude_devices)
+            if arduino_port:
+                index = self.arduino_port_combo.findData(arduino_port)
+                if index >= 0:
+                    self.arduino_port_combo.setCurrentIndex(index)
+                self.connect_arduino(quiet=True)
+
+    def update_auto_retry_timer(self):
+        if not hasattr(self, "auto_retry_timer"):
+            return
+
+        should_retry = (
+            self.mode_combo.currentData() == "local"
+            and (not self.clearcore_connected or not self.arduino_connected)
+        )
+
+        if should_retry and not self.auto_retry_timer.isActive():
+            self.auto_retry_timer.start()
+        elif not should_retry and self.auto_retry_timer.isActive():
+            self.auto_retry_timer.stop()
+
+    def find_preferred_port(self, role: str, exclude_devices=None):
+        excluded = exclude_devices or set()
+        for port in getattr(self, "available_ports", []):
+            if port["device"] in excluded:
+                continue
+            if port.get("role") == role:
+                return port["device"]
+        return None
 
     def display_role_for_port(self, port_info):
         device = port_info["device"]
         if self.clearcore_connected and self.clearcore_client is not None and self.clearcore_client.port == device:
-            return "ClearCore (connected)"
+            return "ClearCore"
         if self.arduino_connected and self.arduino_client is not None and self.arduino_client.port == device:
-            return "Arduino (connected)"
+            return "Arduino"
         return port_info.get("role", "Unknown")
 
-    def connect_arduino(self):
+    def connect_arduino(self, quiet: bool = False):
         port = self.arduino_port_combo.currentData()
         if not port:
-            self.log_signal.emit("Select a serial port before connecting to Arduino")
+            if not quiet:
+                self.log_signal.emit("Select a serial port before connecting to Arduino")
+            return
+
+        if self.clearcore_connected and self.clearcore_client is not None and self.clearcore_client.port == port:
+            if not quiet:
+                self.log_signal.emit(
+                    f"Arduino connect blocked: {port} is already assigned to ClearCore"
+                )
             return
 
         try:
@@ -424,7 +566,8 @@ class ManualTab(QWidget):
             self.arduino_client = None
             self.set_arduino_connected(False)
             self.set_arduino_diag_text("Diagnostics: unavailable")
-            self.log_signal.emit(f"Arduino connection failed: {e}")
+            if not quiet:
+                self.log_signal.emit(f"Arduino connection failed: {e}")
 
     def disconnect_arduino(self):
         try:
@@ -573,7 +716,7 @@ class ManualTab(QWidget):
         return box
 
     def create_m0_group(self):
-        box = QGroupBox("M0 - Primary Servo")
+        box = QGroupBox("M0 | Roll Servo")
         grid = QGridLayout(box)
 
         ping_btn = QPushButton("Ping")
@@ -598,7 +741,7 @@ class ManualTab(QWidget):
 
         self.m0_widgets = [ping_btn, enable_btn, pos1_btn, pos2_btn, stop_btn, disable_btn]
 
-        ping_btn.clicked.connect(lambda: self.send_command("PING"))
+        ping_btn.clicked.connect(lambda: self.send_command("PING_M0"))
         enable_btn.clicked.connect(lambda: self.send_command("ENABLE_M0"))
         pos1_btn.clicked.connect(lambda: self.send_command("MOVE_POS1_M0"))
         pos2_btn.clicked.connect(lambda: self.send_command("MOVE_POS2_M0"))
@@ -608,9 +751,10 @@ class ManualTab(QWidget):
         return box
 
     def create_m1_group(self):
-        box = QGroupBox("M1 - Secondary Servo")
+        box = QGroupBox("M1 | Tilt Servo")
         grid = QGridLayout(box)
 
+        ping_btn = QPushButton("Ping")
         enable_btn = QPushButton("Enable")
         pos1_btn = QPushButton("Forward")
         pos2_btn = QPushButton("Reverse")
@@ -619,15 +763,17 @@ class ManualTab(QWidget):
 
         self.m1_state_label = QLabel("State: OFF")
 
-        grid.addWidget(enable_btn, 0, 0)
+        grid.addWidget(ping_btn, 0, 0)
+        grid.addWidget(enable_btn, 0, 1)
         grid.addWidget(pos1_btn, 1, 0)
         grid.addWidget(pos2_btn, 1, 1)
         grid.addWidget(stop_btn, 2, 0)
         grid.addWidget(disable_btn, 2, 1)
         grid.addWidget(self.m1_state_label, 3, 0, 1, 2)
 
-        self.m1_widgets = [enable_btn, pos1_btn, pos2_btn, stop_btn, disable_btn]
+        self.m1_widgets = [ping_btn, enable_btn, pos1_btn, pos2_btn, stop_btn, disable_btn]
 
+        ping_btn.clicked.connect(lambda: self.send_command("PING_M1"))
         enable_btn.clicked.connect(lambda: self.send_command("ENABLE_M1"))
         pos1_btn.clicked.connect(lambda: self.send_command("MOVE_POS1_M1"))
         pos2_btn.clicked.connect(lambda: self.send_command("MOVE_POS2_M1"))

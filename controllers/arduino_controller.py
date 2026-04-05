@@ -34,6 +34,13 @@ class ArduinoController:
             time.sleep(2)  # Allow Arduino to settle if the board resets on open.
             self.serial_connection.reset_input_buffer()
             self.serial_connection.reset_output_buffer()
+            caps_response = self.send_command("CAPS")
+            if caps_response != "CAPS:ACTUATOR":
+                self.disconnect()
+                raise serial.SerialException(
+                    f"Unexpected CAPS response from {self.port}: {caps_response!r}"
+                )
+
             self.ensure_safe_stop()
             print(f"Connected to Arduino on {self.port}")
             return True
@@ -89,6 +96,10 @@ class ArduinoController:
     def status(self):
         """Request the Arduino firmware status string."""
         return self.send_command("STATUS")
+
+    def capabilities(self):
+        """Request a capabilities identifier from the Arduino firmware."""
+        return self.send_command("CAPS")
 
     def is_connected(self):
         """Check if the serial connection to Arduino is established and open."""
