@@ -3,7 +3,7 @@ import time
 
 
 class ClearCoreController:
-    def __init__(self, port="/dev/ttyACM1", baudrate=115200, timeout=1.0):
+    def __init__(self, port="/dev/ttyACM1", baudrate=9600, timeout=1.0):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
@@ -20,13 +20,29 @@ class ClearCoreController:
                 timeout=self.timeout
             )
             time.sleep(2)
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
 
     def send_command(self, cmd: str) -> str:
         self.connect()
         self.ser.reset_input_buffer()
         self.ser.write((cmd + "\n").encode())
-        response = self.ser.readline().decode(errors="ignore").strip()
-        return response
+        deadline = time.time() + max(self.timeout, 1.0)
+
+        while time.time() < deadline:
+            raw = self.ser.readline()
+            if not raw:
+                continue
+
+            # Some wrong-port/wrong-device cases return long runs of NUL bytes.
+            if raw.strip(b"\x00\r\n") == b"":
+                continue
+
+            response = raw.replace(b"\x00", b"").decode(errors="ignore").strip()
+            if response:
+                return response
+
+        raise RuntimeError(f"No valid response from ClearCore on {self.port}")
 
     def close(self):
         if self.ser and self.ser.is_open:

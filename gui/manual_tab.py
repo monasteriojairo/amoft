@@ -37,6 +37,8 @@ class ManualTab(QWidget):
         self.connection_status = None
         self.m0_state_label = None
         self.m1_state_label = None
+        self.m0_diag_label = None
+        self.m1_diag_label = None
         self.arduino_status_label = None
         self.arduino_diag_label = None
         self.actuator_state_label = None
@@ -169,8 +171,9 @@ class ManualTab(QWidget):
                 raise RuntimeError(response)
 
             self.update_motor_status_from_command(cmd)
+            self.update_motor_diagnostics_from_response(cmd, response)
             self.update_actuator_status_from_command(cmd, response)
-            if cmd != "PING":
+            if not cmd.startswith("PING"):
                 self.refresh_motor_statuses()
 
             self.log_signal.emit(f"{cmd} -> {response}")
@@ -196,6 +199,21 @@ class ManualTab(QWidget):
                 self.set_pi_connected(False)
 
             self.update_connection_label()
+
+    def update_motor_diagnostics_from_response(self, cmd: str, response: str):
+        motor_name = "M0" if cmd.endswith("_M0") else "M1" if cmd.endswith("_M1") else None
+        if motor_name is None:
+            return
+
+        normalized = (response or "").strip()
+        if cmd.startswith("PING_"):
+            self.set_motor_diag_text(motor_name, f"Diagnostics: ping={normalized}")
+        elif cmd.startswith("ENABLE_"):
+            self.set_motor_diag_text(motor_name, f"Diagnostics: enable={normalized}")
+        elif cmd.startswith("DISABLE_"):
+            self.set_motor_diag_text(motor_name, f"Diagnostics: disable={normalized}")
+        elif cmd.startswith("MOVE_") or cmd.startswith("STOP_"):
+            self.set_motor_diag_text(motor_name, f"Diagnostics: reply={normalized}")
 
     def command_transport_ready(self):
         if self.mode_combo.currentData() == "local":
@@ -249,6 +267,12 @@ class ManualTab(QWidget):
         self.clearcore_connection_signal.emit(connected)
         self.refresh_port_labels()
         self.update_auto_retry_timer()
+        if connected:
+            self.set_motor_diag_text("M0", "Diagnostics: connected")
+            self.set_motor_diag_text("M1", "Diagnostics: connected")
+        else:
+            self.set_motor_diag_text("M0", "Diagnostics: disconnected")
+            self.set_motor_diag_text("M1", "Diagnostics: disconnected")
         self.update_connection_controls()
 
     def set_arduino_connected(self, connected: bool):
@@ -282,14 +306,27 @@ class ManualTab(QWidget):
                 self.m1_state_label.setText(label_text)
             self.m1_status_signal.emit(status)
 
+    def set_motor_diag_text(self, motor_name: str, text: str):
+        if motor_name == "M0":
+            if self.m0_diag_label is not None:
+                self.m0_diag_label.setText(text)
+        else:
+            if self.m1_diag_label is not None:
+                self.m1_diag_label.setText(text)
+
     def update_motor_status_from_command(self, cmd: str):
         motor_name = "M0" if cmd.endswith("_M0") else "M1" if cmd.endswith("_M1") else None
         if motor_name is None:
             return
 
+        if cmd.startswith("PING_"):
+            self.set_motor_diag_text(motor_name, f"Diagnostics: ping=sent")
+            return
+
         if cmd.startswith("ENABLE_"):
             self.set_motor_status(motor_name, "enabled")
             self.set_clearcore_connected(True)
+            self.set_motor_diag_text(motor_name, "Diagnostics: command=enable")
             return
 
         if cmd.startswith("DISABLE_"):
@@ -297,12 +334,15 @@ class ManualTab(QWidget):
                 self.set_motor_status(motor_name, "disabled")
             else:
                 self.set_motor_status(motor_name, "off")
+            self.set_motor_diag_text(motor_name, "Diagnostics: command=disable")
             return
 
         if cmd.startswith("MOVE_") or cmd.startswith("STOP_"):
             if self.clearcore_connected:
                 enabled = self.m0_enabled if motor_name == "M0" else self.m1_enabled
                 self.set_motor_status(motor_name, "enabled" if enabled else "disabled")
+            action = cmd.replace(f"_{motor_name}", "").lower()
+            self.set_motor_diag_text(motor_name, f"Diagnostics: command={action}")
 
     def update_actuator_status_from_command(self, cmd: str, response: str):
         if self.actuator_state_label is None or not self.is_actuator_command(cmd):
@@ -337,12 +377,14 @@ class ManualTab(QWidget):
 
                 previous = self.last_motor_status[motor_name]
                 self.set_motor_status(motor_name, status)
+                self.set_motor_diag_text(motor_name, f"Diagnostics: status={status.upper()}")
                 if status != previous:
                     self.log_signal.emit(f"{motor_name} status -> {status.upper()}")
                 self.last_motor_status[motor_name] = status
             except Exception as e:
                 self.log_signal.emit(f"{motor_name} status check failed: {e}")
                 self.set_motor_status(motor_name, "off")
+                self.set_motor_diag_text(motor_name, "Diagnostics: status=ERROR")
 
     def log_firmware_identity(self):
         try:
@@ -727,6 +769,7 @@ class ManualTab(QWidget):
         disable_btn = QPushButton("Disable")
 
         self.m0_state_label = QLabel("State: OFF")
+        self.m0_diag_label = QLabel("Diagnostics: unavailable")
 
         grid.addWidget(ping_btn, 0, 0)
         grid.addWidget(enable_btn, 0, 1)
@@ -738,6 +781,7 @@ class ManualTab(QWidget):
         grid.addWidget(disable_btn, 2, 1)
 
         grid.addWidget(self.m0_state_label, 3, 0, 1, 2)
+        grid.addWidget(self.m0_diag_label, 4, 0, 1, 2)
 
         self.m0_widgets = [ping_btn, enable_btn, pos1_btn, pos2_btn, stop_btn, disable_btn]
 
@@ -762,6 +806,7 @@ class ManualTab(QWidget):
         disable_btn = QPushButton("Disable")
 
         self.m1_state_label = QLabel("State: OFF")
+        self.m1_diag_label = QLabel("Diagnostics: unavailable")
 
         grid.addWidget(ping_btn, 0, 0)
         grid.addWidget(enable_btn, 0, 1)
@@ -770,6 +815,7 @@ class ManualTab(QWidget):
         grid.addWidget(stop_btn, 2, 0)
         grid.addWidget(disable_btn, 2, 1)
         grid.addWidget(self.m1_state_label, 3, 0, 1, 2)
+        grid.addWidget(self.m1_diag_label, 4, 0, 1, 2)
 
         self.m1_widgets = [ping_btn, enable_btn, pos1_btn, pos2_btn, stop_btn, disable_btn]
 

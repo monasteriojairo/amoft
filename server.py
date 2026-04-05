@@ -1,14 +1,31 @@
 import socket
+
+from controllers.actuator_controller import ActuatorController
 from controllers.clearcore_controller import ClearCoreController
+from utils.config_manager import load_config
 
 HOST = "0.0.0.0"
 PORT = 5000
 
-clearcore = ClearCoreController(port="/dev/ttyACM1")
+config = load_config()
+clearcore = ClearCoreController(port=config["clearcore_port"])
+actuator = ActuatorController(port=config["arduino_port"])
+
+
+def is_actuator_command(cmd: str) -> bool:
+    return cmd in {
+        "EXTEND",
+        "RETRACT",
+        "HOME",
+        "STOP",
+        "STOP_ACTUATOR",
+        "STATUS_ACTUATOR",
+        "LIMITS",
+    }
 
 
 def handle_command(cmd: str) -> str:
-    global clearcore
+    global clearcore, actuator
 
     print(f"Received from GUI: {cmd}")
 
@@ -24,6 +41,21 @@ def handle_command(cmd: str) -> str:
 
         clearcore = ClearCoreController(port=port)
         return f"OK SET_CLEARCORE_PORT {port}"
+
+    if cmd.startswith("SET_ARDUINO_PORT:"):
+        port = cmd.split(":", 1)[1].strip()
+        try:
+            actuator.close()
+        except Exception:
+            pass
+
+        actuator = ActuatorController(port=port)
+        return f"OK SET_ARDUINO_PORT {port}"
+
+    if is_actuator_command(cmd):
+        response = actuator.send_command(cmd)
+        print(f"Actuator response: {response}")
+        return response
 
     response = clearcore.send_command(cmd)
     print(f"ClearCore response: {response}")
