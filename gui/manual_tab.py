@@ -17,6 +17,8 @@ class ManualTab(QWidget):
     arduino_connection_signal = Signal(bool)
     m0_status_signal = Signal(str)
     m1_status_signal = Signal(str)
+    hardware_start_requested = Signal()
+    hardware_stop_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -42,7 +44,18 @@ class ManualTab(QWidget):
         self.arduino_status_label = None
         self.arduino_diag_label = None
         self.actuator_state_label = None
+        self.machine_state_label = None
+        self.machine_inputs_label = None
         self.last_motor_status = {"M0": "off", "M1": "off"}
+        self.machine_state = "idle"
+        self.system_homed = False
+        self.system_faulted = False
+        self.estop_active = False
+        self.auto_cycle_running = False
+        self.home_sequence_active = False
+        self.home_step = None
+        self.home_poll_attempts = 0
+        self.last_led_state = None
 
         layout = QHBoxLayout(self)
 
@@ -67,6 +80,12 @@ class ManualTab(QWidget):
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(1500)
         self.status_timer.timeout.connect(self.refresh_motor_statuses)
+        self.supervisor_timer = QTimer(self)
+        self.supervisor_timer.setInterval(300)
+        self.supervisor_timer.timeout.connect(self.poll_supervisor_state)
+        self.home_timer = QTimer(self)
+        self.home_timer.setInterval(300)
+        self.home_timer.timeout.connect(self.advance_home_sequence)
         self.auto_retry_timer = QTimer(self)
         self.auto_retry_timer.setInterval(5000)
         self.auto_retry_timer.timeout.connect(self.auto_retry_devices)
@@ -89,11 +108,14 @@ class ManualTab(QWidget):
             self.set_pi_connected(self.pi_connected)
             if self.pi_connected:
                 self.status_timer.start()
+                self.supervisor_timer.start()
+                self.refresh_supervisor_snapshot()
             self.update_connection_label()
         except Exception as e:
             self.pi_connected = False
             self.set_pi_connected(False)
             self.status_timer.stop()
+            self.supervisor_timer.stop()
             self.log_signal.emit(f"Pi connection failed: {e}")
             self.update_connection_label()
 
@@ -160,6 +182,10 @@ class ManualTab(QWidget):
         self.set_motor_status("M0", "off")
         self.set_motor_status("M1", "off")
         self.status_timer.stop()
+        self.supervisor_timer.stop()
+        self.home_timer.stop()
+        self.home_sequence_active = False
+        self.set_machine_state("idle")
         self.update_connection_label()
         self.log_signal.emit("Disconnected all links")
 
@@ -200,6 +226,291 @@ class ManualTab(QWidget):
 
             self.update_connection_label()
 
+    def parse_csv_response(self, response: str, prefix: str):
+        if response is None:
+            return {}
+        normalized = response.strip()
+        if not normalized.startswith(prefix):
+            return {}
+        payload = normalized[len(prefix):]
+        parts = [part.strip() for part in payload.split(",") if part.strip()]
+        parsed = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            parsed[key.strip()] = value.strip()
+        return parsed
+
+    def set_machine_state(self, state: str):
+        self.machine_state = state
+        if self.machine_state_label is not None:
+            self.machine_state_label.setText(f"Machine: {state.upper()}")
+        self.update_clearcore_leds()
+
+    def set_machine_inputs_text(self, text: str):
+        if self.machine_inputs_label is not None:
+            self.machine_inputs_label.setText(text)
+
+    def send_pi_best_effort(self, command: str):
+        try:
+            return self.pi_client.send(command)
+        except Exception:
+            return None
+
+    def refresh_supervisor_snapshot(self):
+        self.update_supervisor_inputs()
+        self.update_actuator_supervisor_status()
+        self.update_clearcore_leds()
+
+    def poll_supervisor_state(self):
+        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+            return
+
+        self.refresh_supervisor_snapshot()
+
+        try:
+            event_response = self.pi_client.send("GPIO_EVENTS")
+        except Exception as e:
+            self.log_signal.emit(f"Supervisor event poll failed: {e}")
+            self.set_pi_connected(False)
+            self.supervisor_timer.stop()
+            return
+
+        if event_response == "EVENT:NONE":
+            return
+
+        if event_response.startswith("EVENT:"):
+            self.handle_clearcore_event(event_response.split(":", 1)[1].strip())
+
+    def update_supervisor_inputs(self):
+        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+            return
+
+        try:
+            gpio_input_response = self.pi_client.send("GPIO_INPUTS")
+            clearcore_input_response = self.pi_client.send("INPUTS")
+            controller_response = self.pi_client.send("CONTROLLER_STATE")
+        except Exception as e:
+            self.log_signal.emit(f"Supervisor input poll failed: {e}")
+            return
+
+        gpio_inputs = self.parse_csv_response(gpio_input_response, "GPIO_INPUTS:")
+        inputs = self.parse_csv_response(clearcore_input_response, "INPUTS:")
+        controller = self.parse_csv_response(controller_response, "CONTROLLER_STATE:")
+
+        self.estop_active = inputs.get("ESTOP") == "1"
+        clearcore_fault = controller.get("FAULT") == "1"
+        clearcore_homed = controller.get("M0_HOMED") == "1" and controller.get("M1_HOMED") == "1"
+        self.system_homed = clearcore_homed and not self.home_sequence_active
+
+        if self.estop_active:
+            self.system_faulted = True
+            self.set_machine_state("estop_active")
+        elif clearcore_fault and not self.home_sequence_active:
+            self.system_faulted = True
+            self.set_machine_state("faulted")
+        elif not self.home_sequence_active and not self.auto_cycle_running:
+            self.system_faulted = False
+            self.set_machine_state("ready" if self.system_homed else "idle")
+
+        summary = (
+            f"Inputs: estop={inputs.get('ESTOP', '?')} start={gpio_inputs.get('START', '?')} "
+            f"stop={gpio_inputs.get('STOP', '?')} home={gpio_inputs.get('HOME', '?')} "
+            f"m0_home={inputs.get('M0_HOME', '?')} m0_limit={inputs.get('M0_LIMIT', '?')} "
+            f"m1_home={inputs.get('M1_HOME', '?')} m1_limit={inputs.get('M1_LIMIT', '?')}"
+        )
+        self.set_machine_inputs_text(summary)
+
+    def update_actuator_supervisor_status(self):
+        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+            return
+
+        try:
+            actuator_status = self.pi_client.send("STATUS_ACTUATOR")
+        except Exception:
+            return
+
+        normalized = (actuator_status or "").strip().upper()
+        if self.actuator_state_label is not None and normalized:
+            self.actuator_state_label.setText(f"State: {normalized}")
+
+        if normalized == "FAULT":
+            self.system_faulted = True
+            if not self.estop_active and not self.home_sequence_active:
+                self.set_machine_state("faulted")
+
+    def update_clearcore_leds(self):
+        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+            return
+
+        ready = int(self.machine_state == "ready")
+        running = int(self.machine_state in {"running", "homing", "actuator_retracting"})
+        fault = int(self.machine_state in {"faulted", "estop_active"})
+        led_state = (ready, running, fault)
+        if led_state == self.last_led_state:
+            return
+
+        try:
+            self.pi_client.send(f"GPIO_SET_LEDS:{ready},{running},{fault}")
+            self.last_led_state = led_state
+        except Exception as e:
+            self.log_signal.emit(f"LED update failed: {e}")
+
+    def handle_clearcore_event(self, event_name: str):
+        normalized = event_name.upper()
+        self.log_signal.emit(f"Hardware event -> {normalized}")
+        if normalized == "START":
+            self.handle_hardware_start()
+        elif normalized == "STOP":
+            self.handle_hardware_stop()
+        elif normalized == "HOME":
+            self.handle_hardware_home()
+
+    def handle_hardware_start(self):
+        if self.estop_active:
+            self.log_signal.emit("Hardware START rejected: E-stop active")
+            self.set_machine_state("estop_active")
+            return
+        if self.system_faulted:
+            self.log_signal.emit("Hardware START rejected: system faulted")
+            self.set_machine_state("faulted")
+            return
+        if not self.system_homed:
+            self.log_signal.emit("Hardware START rejected: system not homed")
+            self.set_machine_state("idle")
+            return
+
+        self.set_machine_state("running")
+        self.hardware_start_requested.emit()
+
+    def handle_hardware_stop(self):
+        self.hardware_stop_requested.emit()
+        for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
+            self.send_pi_best_effort(command)
+        if self.estop_active:
+            self.set_machine_state("estop_active")
+        else:
+            self.set_machine_state("stopped")
+
+    def handle_hardware_home(self):
+        if self.home_sequence_active:
+            self.log_signal.emit("Hardware HOME ignored: homing already active")
+            return
+        if self.estop_active:
+            self.log_signal.emit("Hardware HOME rejected: E-stop active")
+            self.set_machine_state("estop_active")
+            return
+        self.start_home_sequence()
+
+    def start_home_sequence(self):
+        self.send_pi_best_effort("CLEAR_FAULTS")
+        self.send_pi_best_effort("CLEAR_FAULT")
+        self.home_sequence_active = True
+        self.system_faulted = False
+        self.system_homed = False
+        self.home_step = "actuator_retract"
+        self.home_poll_attempts = 0
+        self.set_machine_state("actuator_retracting")
+
+        try:
+            response = self.pi_client.send("HOME_ACTUATOR")
+        except Exception as e:
+            self.fail_home_sequence(f"Actuator home command failed: {e}")
+            return
+
+        if response.strip().upper().startswith("ERR"):
+            self.fail_home_sequence(f"Actuator home rejected: {response}")
+            return
+
+        self.log_signal.emit(f"Home sequence -> {response}")
+        self.home_timer.start()
+
+    def advance_home_sequence(self):
+        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+            self.fail_home_sequence("Pi link unavailable during homing")
+            return
+
+        if self.home_step == "actuator_retract":
+            self.home_poll_attempts += 1
+            try:
+                status = self.pi_client.send("STATUS_ACTUATOR").strip().upper()
+            except Exception as e:
+                self.fail_home_sequence(f"Actuator status poll failed: {e}")
+                return
+
+            self.actuator_state_label.setText(f"State: {status}")
+            if status == "RETRACTED":
+                self.home_step = "servo_m0"
+                self.set_machine_state("homing")
+                return
+            if status == "FAULT" or self.home_poll_attempts > 60:
+                self.fail_home_sequence("Actuator failed to reach retracted state")
+                return
+            return
+
+        if self.home_step == "servo_m0":
+            try:
+                response = self.pi_client.send("HOME_M0")
+            except Exception as e:
+                self.fail_home_sequence(f"M0 home command failed: {e}")
+                return
+            if response.strip().upper().startswith("ERR"):
+                self.fail_home_sequence(f"M0 home failed: {response}")
+                return
+            self.log_signal.emit(f"Home sequence -> {response}")
+            self.home_step = "servo_m1"
+            return
+
+        if self.home_step == "servo_m1":
+            try:
+                response = self.pi_client.send("HOME_M1")
+            except Exception as e:
+                self.fail_home_sequence(f"M1 home command failed: {e}")
+                return
+            if response.strip().upper().startswith("ERR"):
+                self.fail_home_sequence(f"M1 home failed: {response}")
+                return
+            self.log_signal.emit(f"Home sequence -> {response}")
+            self.complete_home_sequence()
+
+    def fail_home_sequence(self, message: str):
+        self.home_timer.stop()
+        self.home_sequence_active = False
+        self.home_step = None
+        self.system_faulted = True
+        self.system_homed = False
+        for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
+            self.send_pi_best_effort(command)
+        self.set_machine_state("faulted")
+        self.log_signal.emit(message)
+
+    def complete_home_sequence(self):
+        self.home_timer.stop()
+        self.home_sequence_active = False
+        self.home_step = None
+        self.system_faulted = False
+        self.system_homed = True
+        self.set_machine_state("ready")
+        self.log_signal.emit("Home sequence complete")
+
+    def on_cycle_state_changed(self, state: str):
+        self.auto_cycle_running = state == "running"
+        if self.estop_active:
+            self.set_machine_state("estop_active")
+        elif self.home_sequence_active:
+            self.set_machine_state("homing")
+        elif state == "running":
+            self.set_machine_state("running")
+        elif self.system_faulted:
+            self.set_machine_state("faulted")
+        elif self.system_homed:
+            self.set_machine_state("ready")
+        elif state == "stopped":
+            self.set_machine_state("stopped")
+        else:
+            self.set_machine_state("idle")
+
     def update_motor_diagnostics_from_response(self, cmd: str, response: str):
         motor_name = "M0" if cmd.endswith("_M0") else "M1" if cmd.endswith("_M1") else None
         if motor_name is None:
@@ -226,7 +537,18 @@ class ManualTab(QWidget):
         return self.pi_connected
 
     def is_actuator_command(self, cmd: str):
-        return cmd in {"EXTEND", "RETRACT", "STOP_ACTUATOR", "STOP"}
+        return cmd in {
+            "EXTEND",
+            "RETRACT",
+            "HOME",
+            "HOME_ACTUATOR",
+            "RETRACT_TO_HOME",
+            "STOP_ACTUATOR",
+            "STOP",
+            "STATUS_ACTUATOR",
+            "LIMITS",
+            "CLEAR_FAULT",
+        }
 
     def route_command(self, cmd: str):
         if self.is_actuator_command(cmd):
@@ -361,6 +683,12 @@ class ManualTab(QWidget):
             self.actuator_state_label.setText("State: CYCLING")
             if normalized == "DONE CYCLE":
                 self.actuator_state_label.setText("State: IDLE")
+        elif cmd in {"HOME", "HOME_ACTUATOR", "RETRACT_TO_HOME"} and normalized in {"STARTED HOME", "DONE HOME", "RETRACTED"}:
+            self.actuator_state_label.setText("State: HOMING")
+            if normalized in {"DONE HOME", "RETRACTED"}:
+                self.actuator_state_label.setText("State: RETRACTED")
+        elif cmd == "STATUS_ACTUATOR" and normalized:
+            self.actuator_state_label.setText(f"State: {normalized}")
         elif cmd in {"STOP_ACTUATOR", "STOP"} and normalized == "STOPPED":
             self.actuator_state_label.setText("State: STOPPED")
 
@@ -692,6 +1020,8 @@ class ManualTab(QWidget):
         self.connect_btn = QPushButton("Connect ClearCore")
         disconnect_btn = QPushButton("Disconnect Link")
         self.connection_status = QLabel("Status: Local mode idle")
+        self.machine_state_label = QLabel("Machine: IDLE")
+        self.machine_inputs_label = QLabel("Inputs: unavailable")
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh Ports")
         set_port_btn = QPushButton("Use Selected Port")
@@ -707,15 +1037,22 @@ class ManualTab(QWidget):
         grid.addWidget(self.connect_btn, 1, 0, 1, 2)
         grid.addWidget(disconnect_btn, 1, 2)
         grid.addWidget(self.connection_status, 2, 0, 1, 3)
-        grid.addWidget(QLabel("Detected Ports:"), 3, 0)
-        grid.addWidget(self.port_combo, 3, 1, 1, 2)
-        grid.addWidget(refresh_btn, 4, 0)
-        grid.addWidget(set_port_btn, 4, 1)
+        grid.addWidget(self.machine_state_label, 3, 0, 1, 3)
+        grid.addWidget(self.machine_inputs_label, 4, 0, 1, 3)
+        grid.addWidget(QLabel("Detected Ports:"), 5, 0)
+        grid.addWidget(self.port_combo, 5, 1, 1, 2)
+        grid.addWidget(refresh_btn, 6, 0)
+        grid.addWidget(set_port_btn, 6, 1)
 
         return box
 
     def on_mode_changed(self):
         self.update_connection_label()
+        if self.mode_combo.currentData() != "pi":
+            self.supervisor_timer.stop()
+            self.home_timer.stop()
+            self.home_sequence_active = False
+            self.set_machine_state("idle")
         self.log_signal.emit(f"Connection mode set to: {self.mode_combo.currentText()}")
 
     def create_arduino_group(self):

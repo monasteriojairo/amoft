@@ -4,6 +4,17 @@
     "baud_rate": 115200,
     "m1_enabled": false,
     "simulation_mode": true,
+    "pi_gpio": {
+        "enabled": true,
+        "start_button_pin": 17,
+        "stop_button_pin": 27,
+        "home_button_pin": 22,
+        "ready_led_pin": 5,
+        "running_led_pin": 6,
+        "fault_led_pin": 13,
+        "buttons_active_high": false,
+        "leds_active_high": true
+    },
     "auto_sequences": {
         "Demo Cycle": [
             {

@@ -1,2 +1,3 @@
 pyserial
 PySide6
+RPi.GPIO

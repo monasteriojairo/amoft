@@ -54,12 +54,15 @@ class MainWindow(QMainWindow):
         self.auto_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.auto_tab.command_signal.connect(self.manual_tab.send_command)
         self.auto_tab.reconnect_signal.connect(self.reconnect_from_auto)
+        self.auto_tab.cycle_state_signal.connect(self.manual_tab.on_cycle_state_changed)
         self.settings_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.manual_tab.pi_connection_signal.connect(self.update_pi_status)
         self.manual_tab.clearcore_connection_signal.connect(self.update_clearcore_status)
         self.manual_tab.arduino_connection_signal.connect(self.update_arduino_status)
         self.manual_tab.m0_status_signal.connect(self.update_m0_status)
         self.manual_tab.m1_status_signal.connect(self.update_m1_status)
+        self.manual_tab.hardware_start_requested.connect(self.auto_tab.start_from_hardware)
+        self.manual_tab.hardware_stop_requested.connect(self.auto_tab.abort_from_hardware)
 
     def reconnect_from_auto(self):
         self.manual_tab.disconnect_all()

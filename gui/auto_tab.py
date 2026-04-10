@@ -26,6 +26,7 @@ class AutoTab(QWidget):
     log_signal = Signal(str)
     command_signal = Signal(str)
     reconnect_signal = Signal()
+    cycle_state_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -419,8 +420,20 @@ class AutoTab(QWidget):
         self.progress.setValue(0)
         self.step_label.setText("Current Step: STARTING")
         self.log_signal.emit(f"Auto: Starting queued sequence with {len(self.execution_steps)} step(s)")
+        self.cycle_state_signal.emit("running")
         self.update_button_states()
         self.advance_sequence()
+
+    def start_from_hardware(self):
+        if not self.sequence_steps:
+            self.log_signal.emit("Auto: Hardware START ignored because no queue is loaded")
+            self.cycle_state_signal.emit("idle")
+            return False
+        if self.is_running:
+            self.log_signal.emit("Auto: Hardware START ignored because queue is already running")
+            return False
+        self.start_cycle()
+        return True
 
     def expand_steps_for_run(self):
         execution = []
@@ -538,6 +551,7 @@ class AutoTab(QWidget):
     def abort_cycle(self):
         if not self.is_running:
             self.log_signal.emit("Auto: Abort pressed")
+            self.cycle_state_signal.emit("stopped")
             return
 
         self.delay_timer.stop()
@@ -553,7 +567,11 @@ class AutoTab(QWidget):
         self.step_label.setText("Current Step: ABORTED")
         self.progress.setValue(0)
         self.log_signal.emit("Auto: Abort pressed")
+        self.cycle_state_signal.emit("stopped")
         self.update_button_states()
+
+    def abort_from_hardware(self):
+        self.abort_cycle()
 
     def request_reconnect(self):
         if self.is_running:
@@ -571,6 +589,7 @@ class AutoTab(QWidget):
         self.step_label.setText("Current Step: IDLE")
         self.progress.setValue(0)
         self.log_signal.emit("Auto: Reset pressed")
+        self.cycle_state_signal.emit("idle")
         self.update_button_states()
 
     def finish_cycle(self, message):
@@ -580,6 +599,7 @@ class AutoTab(QWidget):
         self.step_label.setText("Current Step: COMPLETE")
         self.progress.setValue(100)
         self.log_signal.emit(message)
+        self.cycle_state_signal.emit("idle")
         self.update_button_states()
 
     def update_button_states(self):

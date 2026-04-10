@@ -9,7 +9,18 @@ DEFAULT_CONFIG = {
     "baud_rate": 115200,
     "m1_enabled": False,
     "simulation_mode": True,
-    "auto_sequences": {}
+    "auto_sequences": {},
+    "pi_gpio": {
+        "enabled": True,
+        "start_button_pin": 17,
+        "stop_button_pin": 27,
+        "home_button_pin": 22,
+        "ready_led_pin": 5,
+        "running_led_pin": 6,
+        "fault_led_pin": 13,
+        "buttons_active_high": False,
+        "leds_active_high": True,
+    },
 }
 
 def load_config():
