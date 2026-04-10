@@ -44,6 +44,7 @@ class ManualTab(QWidget):
         self.arduino_status_label = None
         self.arduino_diag_label = None
         self.actuator_state_label = None
+        self.actuator_limits_label = None
         self.machine_state_label = None
         self.machine_inputs_label = None
         self.last_motor_status = {"M0": "off", "M1": "off"}
@@ -56,6 +57,7 @@ class ManualTab(QWidget):
         self.home_step = None
         self.home_poll_attempts = 0
         self.last_led_state = None
+        self.last_gpio_inputs_response = None
 
         layout = QHBoxLayout(self)
 
@@ -107,6 +109,8 @@ class ManualTab(QWidget):
             self.log_signal.emit(f"Pi connection successful: {response}")
             self.set_pi_connected(self.pi_connected)
             if self.pi_connected:
+                gpio_config = self.pi_client.send("GPIO_CONFIG")
+                self.log_signal.emit(gpio_config)
                 self.status_timer.start()
                 self.supervisor_timer.start()
                 self.refresh_supervisor_snapshot()
@@ -190,6 +194,7 @@ class ManualTab(QWidget):
         self.log_signal.emit("Disconnected all links")
 
     def send_command(self, cmd: str):
+        self.log_signal.emit(f"Command given -> {cmd}")
         try:
             response = self.route_command(cmd)
 
@@ -253,9 +258,13 @@ class ManualTab(QWidget):
             self.machine_inputs_label.setText(text)
 
     def send_pi_best_effort(self, command: str):
+        self.log_signal.emit(f"Command given -> {command}")
         try:
-            return self.pi_client.send(command)
-        except Exception:
+            response = self.pi_client.send(command)
+            self.log_signal.emit(f"{command} -> {response}")
+            return response
+        except Exception as e:
+            self.log_signal.emit(f"Command failed ({command}): {e}")
             return None
 
     def refresh_supervisor_snapshot(self):
@@ -281,6 +290,7 @@ class ManualTab(QWidget):
             return
 
         if event_response.startswith("EVENT:"):
+            self.log_signal.emit(f"GPIO event poll -> {event_response}")
             self.handle_clearcore_event(event_response.split(":", 1)[1].strip())
 
     def update_supervisor_inputs(self):
@@ -294,6 +304,10 @@ class ManualTab(QWidget):
         except Exception as e:
             self.log_signal.emit(f"Supervisor input poll failed: {e}")
             return
+
+        if gpio_input_response != self.last_gpio_inputs_response:
+            self.log_signal.emit(f"GPIO inputs -> {gpio_input_response}")
+            self.last_gpio_inputs_response = gpio_input_response
 
         gpio_inputs = self.parse_csv_response(gpio_input_response, "GPIO_INPUTS:")
         inputs = self.parse_csv_response(clearcore_input_response, "INPUTS:")
@@ -548,6 +562,9 @@ class ManualTab(QWidget):
             "STATUS_ACTUATOR",
             "LIMITS",
             "CLEAR_FAULT",
+            "CYCLE",
+            "DIAG",
+            "DIAGNOSTICS",
         }
 
     def route_command(self, cmd: str):
@@ -691,6 +708,10 @@ class ManualTab(QWidget):
             self.actuator_state_label.setText(f"State: {normalized}")
         elif cmd in {"STOP_ACTUATOR", "STOP"} and normalized == "STOPPED":
             self.actuator_state_label.setText("State: STOPPED")
+        elif cmd == "LIMITS" and normalized.startswith("LIMITS:") and self.actuator_limits_label is not None:
+            self.actuator_limits_label.setText(response)
+        elif cmd in {"DIAG", "DIAGNOSTICS"} and normalized.startswith("DIAG:") and self.actuator_limits_label is not None:
+            self.actuator_limits_label.setText(response)
 
     def refresh_motor_statuses(self):
         if not self.command_transport_ready():
@@ -1172,20 +1193,29 @@ class ManualTab(QWidget):
         extend_btn = QPushButton("Extend")
         retract_btn = QPushButton("Retract")
         stop_btn = QPushButton("Stop")
+        status_btn = QPushButton("Status")
+        limits_btn = QPushButton("Limits")
+        diag_btn = QPushButton("Diagnostics")
 
         self.actuator_state_label = QLabel("State: IDLE")
-        limit_label = QLabel("Limits: Unknown")
+        self.actuator_limits_label = QLabel("Limits: Unknown")
 
-        self.actuator_widgets = [extend_btn, retract_btn, stop_btn]
+        self.actuator_widgets = [extend_btn, retract_btn, stop_btn, status_btn, limits_btn, diag_btn]
 
         extend_btn.clicked.connect(lambda: self.send_command("EXTEND"))
         retract_btn.clicked.connect(lambda: self.send_command("RETRACT"))
         stop_btn.clicked.connect(lambda: self.send_command("STOP_ACTUATOR"))
+        status_btn.clicked.connect(lambda: self.send_command("STATUS_ACTUATOR"))
+        limits_btn.clicked.connect(lambda: self.send_command("LIMITS"))
+        diag_btn.clicked.connect(lambda: self.send_command("DIAG"))
 
         layout.addWidget(extend_btn)
         layout.addWidget(retract_btn)
         layout.addWidget(stop_btn)
+        layout.addWidget(status_btn)
+        layout.addWidget(limits_btn)
+        layout.addWidget(diag_btn)
         layout.addWidget(self.actuator_state_label)
-        layout.addWidget(limit_label)
+        layout.addWidget(self.actuator_limits_label)
 
         return box

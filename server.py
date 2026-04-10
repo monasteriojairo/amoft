@@ -26,6 +26,9 @@ def is_actuator_command(cmd: str) -> bool:
         "STATUS_ACTUATOR",
         "LIMITS",
         "CLEAR_FAULT",
+        "CYCLE",
+        "DIAG",
+        "DIAGNOSTICS",
     }
 
 
@@ -61,6 +64,9 @@ def handle_command(cmd: str) -> str:
 
     if cmd == "PING":
         return "PONG"
+
+    if cmd == "GPIO_CONFIG":
+        return gpio.config_summary()
 
     gpio_response = handle_gpio_command(cmd)
     if gpio_response is not None:

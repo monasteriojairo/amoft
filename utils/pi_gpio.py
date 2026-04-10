@@ -58,6 +58,14 @@ class PiGpioManager:
             for name, pin in self.button_pins.items()
         }
 
+    def _read_button_raws(self):
+        if not self.available:
+            return {name: "NA" for name in self.button_pins}
+        return {
+            name: GPIO.input(pin)
+            for name, pin in self.button_pins.items()
+        }
+
     def _latch_event(self, event_name: str):
         if self._pending_event == "NONE":
             self._pending_event = event_name
@@ -91,11 +99,25 @@ class PiGpioManager:
     def input_summary(self) -> str:
         self.poll()
         with self._lock:
+            raw_states = self._read_button_raws()
             return (
                 f"GPIO_INPUTS:START={int(self._button_states['START'])},"
                 f"STOP={int(self._button_states['STOP'])},"
-                f"HOME={int(self._button_states['HOME'])}"
+                f"HOME={int(self._button_states['HOME'])},"
+                f"START_RAW={raw_states['START']},"
+                f"STOP_RAW={raw_states['STOP']},"
+                f"HOME_RAW={raw_states['HOME']}"
             )
+
+    def config_summary(self) -> str:
+        return (
+            f"GPIO_CONFIG:AVAILABLE={int(self.available)},"
+            f"ENABLED={int(self.enabled)},"
+            f"BUTTON_ACTIVE_HIGH={int(self.button_active_high)},"
+            f"START_PIN={self.button_pins['START']},"
+            f"STOP_PIN={self.button_pins['STOP']},"
+            f"HOME_PIN={self.button_pins['HOME']}"
+        )
 
     def set_leds(self, ready: bool, running: bool, fault: bool):
         with self._lock:

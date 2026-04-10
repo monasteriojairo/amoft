@@ -9,6 +9,7 @@ const int reverseSpeed = 255;
 const unsigned long retractTime = 8000;
 const unsigned long extendTime = 8000;
 const unsigned long cyclePauseTime = 500;
+// Retract confirm uses INPUT_PULLUP by default: open = HIGH, closed to GND = LOW.
 const bool retractConfirmActiveLow = true;
 
 String command = "";
@@ -64,6 +65,11 @@ void loop() {
       if (motionState == FAULTED) {
         Serial.println("ERR FAULTED");
       }
+      else if (retractConfirmActive()) {
+        stopMotor();
+        motionState = IDLE;
+        Serial.println("DONE RETRACT");
+      }
       else {
         startRetract();
         Serial.println("STARTED RETRACT");
@@ -111,6 +117,10 @@ void loop() {
 
     else if (command == "LIMITS") {
       Serial.println(limitSummary());
+    }
+
+    else if (command == "DIAG" || command == "DIAGNOSTICS") {
+      Serial.println(diagnosticSummary());
     }
 
     else if (command == "CLEAR_FAULT") {
@@ -244,6 +254,15 @@ const char *currentStatus() {
 String limitSummary() {
   return String("LIMITS:RETRACT=") + (retractConfirmActive() ? "1" : "0") +
          ",FAULT=" + (motionState == FAULTED ? "1" : "0");
+}
+
+String diagnosticSummary() {
+  return String("DIAG:STATE=") + currentStatus() +
+         ",RETRACT_RAW=" + digitalRead(RetractConfirmPin) +
+         ",RETRACT_ACTIVE=" + (retractConfirmActive() ? "1" : "0") +
+         ",ENABLE=" + digitalRead(EnablePin) +
+         ",PWM_A=" + digitalRead(PWMPinA) +
+         ",PWM_B=" + digitalRead(PWMPinB);
 }
 
 void runForward(int speedVal) {

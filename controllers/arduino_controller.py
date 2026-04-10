@@ -35,7 +35,7 @@ class ArduinoController:
             self.serial_connection.reset_input_buffer()
             self.serial_connection.reset_output_buffer()
             caps_response = self.send_command("CAPS")
-            if caps_response != "CAPS:ACTUATOR":
+            if not (caps_response or "").startswith("CAPS:ACTUATOR"):
                 self.disconnect()
                 raise serial.SerialException(
                     f"Unexpected CAPS response from {self.port}: {caps_response!r}"
