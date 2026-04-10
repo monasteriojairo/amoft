@@ -204,6 +204,7 @@ class ManualTab(QWidget):
             self.update_motor_status_from_command(cmd)
             self.update_motor_diagnostics_from_response(cmd, response)
             self.update_actuator_status_from_command(cmd, response)
+            self.schedule_actuator_diagnostics(cmd)
             if not cmd.startswith("PING"):
                 self.refresh_motor_statuses()
 
@@ -586,6 +587,30 @@ class ManualTab(QWidget):
     def send_local_arduino_command(self, cmd: str):
         translated = "STOP" if cmd == "STOP_ACTUATOR" else cmd
         return self.arduino_client.send_command(translated)
+
+    def schedule_actuator_diagnostics(self, cmd: str):
+        if cmd in {"STATUS_ACTUATOR", "LIMITS", "DIAG", "DIAGNOSTICS"}:
+            return
+        if not self.is_actuator_command(cmd):
+            return
+        QTimer.singleShot(350, self.log_actuator_diagnostics)
+
+    def log_actuator_diagnostics(self):
+        if not self.actuator_transport_ready():
+            return
+
+        for command in ("STATUS_ACTUATOR", "LIMITS", "DIAG"):
+            try:
+                response = self.send_actuator_probe(command)
+                self.log_signal.emit(f"{command} -> {response}")
+                self.update_actuator_status_from_command(command, response)
+            except Exception as e:
+                self.log_signal.emit(f"Actuator diagnostic failed ({command}): {e}")
+
+    def send_actuator_probe(self, cmd: str):
+        if self.mode_combo.currentData() == "local":
+            return self.send_local_arduino_command(cmd)
+        return self.pi_client.send(cmd)
 
     def is_clearpath_command(self, cmd: str):
         return cmd.endswith("_M0") or cmd.endswith("_M1")
