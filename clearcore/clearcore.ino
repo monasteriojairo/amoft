@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v4"
+#define firmwareVersion "clearcore-dual-motor-v5"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -52,6 +52,8 @@ String LimitStatusM0();
 String LimitStatusM1();
 String InputSummary();
 String ControllerStateSummary();
+String FaultSummary();
+String EstopOverrideSummary();
 void WaitForSerialPort(uint32_t timeoutMs);
 bool WaitForHlfbM0();
 bool WaitForHlfbM1();
@@ -64,6 +66,7 @@ bool MoveUntilHomeStateM1(bool targetState, int velocityIndex, uint32_t timeoutM
 void ConfigureInputs();
 void MonitorSafetyInputs();
 bool SignalActive(int16_t rawState, bool activeLow);
+bool RawEstopActive();
 bool EstopActive();
 bool M0HomeActive();
 bool M0LimitActive();
@@ -81,6 +84,8 @@ bool motor1Homed = false;
 bool motor0Homing = false;
 bool motor1Homing = false;
 bool controllerFaultLatched = false;
+bool controllerFaultFromEstop = false;
+bool estopOverrideEnabled = false;
 int motor0VelocitySelection = STOP_SELECTION;
 int motor1VelocitySelection = STOP_SELECTION;
 
@@ -125,12 +130,26 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "PING_M0") return "PONG_M0";
     if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
-    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS";
+    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_OVERRIDE";
     if (cmd == "INPUTS") return InputSummary();
     if (cmd == "CONTROLLER_STATE") return ControllerStateSummary();
+    if (cmd == "FAULTS") return FaultSummary();
+    if (cmd == "ESTOP_OVERRIDE") return EstopOverrideSummary();
+    if (cmd.startsWith("SET_ESTOP_OVERRIDE:")) {
+        String value = cmd.substring(cmd.indexOf(':') + 1);
+        value.trim();
+        estopOverrideEnabled = value == "1" || value == "ON" || value == "TRUE";
+        if (estopOverrideEnabled && controllerFaultFromEstop &&
+            !motor0.StatusReg().bit.MotorInFault && !motor1.StatusReg().bit.MotorInFault) {
+            controllerFaultLatched = false;
+            controllerFaultFromEstop = false;
+        }
+        return EstopOverrideSummary();
+    }
     if (cmd == "CLEAR_FAULTS") {
         if (!EstopActive()) {
             controllerFaultLatched = false;
+            controllerFaultFromEstop = false;
         }
         return controllerFaultLatched ? "ERR CLEAR_FAULTS" : "OK CLEAR_FAULTS";
     }
@@ -207,7 +226,8 @@ bool SignalActive(int16_t rawState, bool activeLow) {
     return activeLow ? rawState == 0 : rawState != 0;
 }
 
-bool EstopActive() { return SignalActive(estopStatus.State(), ESTOP_ACTIVE_LOW); }
+bool RawEstopActive() { return SignalActive(estopStatus.State(), ESTOP_ACTIVE_LOW); }
+bool EstopActive() { return !estopOverrideEnabled && RawEstopActive(); }
 bool M0HomeActive() { return SignalActive(m0HomeSwitch.State(), M0_HOME_ACTIVE_LOW); }
 bool M0LimitActive() { return SignalActive(m0LimitSwitch.State(), M0_LIMIT_ACTIVE_LOW); }
 bool M1HomeActive() { return SignalActive(m1HomeSwitch.State(), M1_HOME_ACTIVE_LOW); }
@@ -220,6 +240,9 @@ bool Motor1MovingTowardLimit() { return motor1VelocitySelection == M1_LIMIT_SELE
 
 void MonitorSafetyInputs() {
     if (EstopActive()) {
+        if (!controllerFaultLatched) {
+            controllerFaultFromEstop = true;
+        }
         controllerFaultLatched = true;
         DisableMotorM0();
         DisableMotorM1();
@@ -229,6 +252,7 @@ void MonitorSafetyInputs() {
     if (motor0Enabled && motor0VelocitySelection != STOP_SELECTION) {
         if (Motor0MovingTowardLimit() && M0LimitActive()) {
             controllerFaultLatched = true;
+            controllerFaultFromEstop = false;
             DisableMotorM0();
         } else if (Motor0MovingTowardHome() && M0HomeActive() && !motor0Homing) {
             StopMotorM0();
@@ -238,6 +262,7 @@ void MonitorSafetyInputs() {
     if (motor1Enabled && motor1VelocitySelection != STOP_SELECTION) {
         if (Motor1MovingTowardLimit() && M1LimitActive()) {
             controllerFaultLatched = true;
+            controllerFaultFromEstop = false;
             DisableMotorM1();
         } else if (Motor1MovingTowardHome() && M1HomeActive() && !motor1Homing) {
             StopMotorM1();
@@ -424,6 +449,7 @@ bool WaitForHlfbM0() {
         if (EstopActive()) return false;
         if (millis() - startTime > HLFB_TIMEOUT_MS) {
             controllerFaultLatched = true;
+            controllerFaultFromEstop = false;
             return false;
         }
     }
@@ -438,6 +464,7 @@ bool WaitForHlfbM1() {
         if (EstopActive()) return false;
         if (millis() - startTime > HLFB_TIMEOUT_MS) {
             controllerFaultLatched = true;
+            controllerFaultFromEstop = false;
             return false;
         }
     }
@@ -471,6 +498,8 @@ String LimitStatusM1() {
 
 String InputSummary() {
     return String("INPUTS:ESTOP=") + (EstopActive() ? "1" : "0") +
+           ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
            ",M0_HOME=" + (M0HomeActive() ? "1" : "0") +
            ",M0_LIMIT=" + (M0LimitActive() ? "1" : "0") +
            ",M1_HOME=" + (M1HomeActive() ? "1" : "0") +
@@ -480,6 +509,22 @@ String InputSummary() {
 String ControllerStateSummary() {
     return String("CONTROLLER_STATE:FAULT=") + (controllerFaultLatched ? "1" : "0") +
            ",ESTOP=" + (EstopActive() ? "1" : "0") +
+           ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
            ",M0_HOMED=" + (motor0Homed ? "1" : "0") +
            ",M1_HOMED=" + (motor1Homed ? "1" : "0");
+}
+
+String FaultSummary() {
+    return String("FAULTS:ESTOP=") + (EstopActive() ? "1" : "0") +
+           ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
+           ",LATCH=" + (controllerFaultLatched ? "1" : "0") +
+           ",LATCH_ESTOP=" + (controllerFaultFromEstop ? "1" : "0") +
+           ",M0_DRIVER=" + (motor0.StatusReg().bit.MotorInFault ? "1" : "0") +
+           ",M1_DRIVER=" + (motor1.StatusReg().bit.MotorInFault ? "1" : "0");
+}
+
+String EstopOverrideSummary() {
+    return String("ESTOP_OVERRIDE:") + (estopOverrideEnabled ? "1" : "0");
 }

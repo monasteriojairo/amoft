@@ -1,13 +1,13 @@
 from PySide6.QtCore import Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QPushButton,
-    QLabel, QGridLayout, QComboBox
+    QLabel, QGridLayout, QComboBox, QCheckBox
 )
 
 from controllers.arduino_controller import ArduinoController
 from controllers.clearcore_controller import ClearCoreController
 from controllers.pi_client import PiClient
-from utils.serial_ports import get_serial_ports
+from utils.serial_ports import PROBE_BAUDRATES, get_serial_ports
 
 
 class ManualTab(QWidget):
@@ -47,6 +47,8 @@ class ManualTab(QWidget):
         self.actuator_limits_label = None
         self.machine_state_label = None
         self.machine_inputs_label = None
+        self.estop_override_checkbox = None
+        self.estop_override_active = False
         self.last_motor_status = {"M0": "off", "M1": "off"}
         self.machine_state = "idle"
         self.system_homed = False
@@ -111,8 +113,11 @@ class ManualTab(QWidget):
             if self.pi_connected:
                 gpio_config = self.pi_client.send("GPIO_CONFIG")
                 self.log_signal.emit(gpio_config)
+                serial_ports = self.pi_client.send("SERIAL_PORTS")
+                self.log_signal.emit(serial_ports)
                 self.status_timer.start()
                 self.supervisor_timer.start()
+                self.sync_estop_override_state()
                 self.refresh_supervisor_snapshot()
             self.update_connection_label()
         except Exception as e:
@@ -141,13 +146,30 @@ class ManualTab(QWidget):
             if self.clearcore_client is not None:
                 self.clearcore_client.close()
 
-            self.clearcore_client = ClearCoreController(port=port)
-            self.clearcore_client.connect()
+            port_info = self.find_port_info(port)
+            identity = None
+            for baudrate in self.baudrate_candidates(port_info):
+                try:
+                    self.clearcore_client = ClearCoreController(port=port, baudrate=baudrate)
+                    self.clearcore_client.connect()
+                    identity = self.read_clearcore_identity()
+                    if self.is_clearcore_identity(identity):
+                        break
+                finally:
+                    if not self.is_clearcore_identity(identity):
+                        if self.clearcore_client is not None:
+                            self.clearcore_client.close()
+                        self.clearcore_client = None
+            else:
+                raise RuntimeError(f"{port} is not ClearCore; identity={identity!r}")
+
             self.log_signal.emit(f"ClearCore connection successful: {port}")
-            self.log_firmware_identity()
+            self.log_firmware_identity(identity=identity)
             self.set_clearcore_connected(True)
             self.set_motor_status("M0", "disabled")
             self.set_motor_status("M1", "disabled")
+            self.sync_estop_override_state()
+            self.log_clearcore_diagnostics()
             self.status_timer.start()
             self.update_connection_label()
         except Exception as e:
@@ -258,6 +280,69 @@ class ManualTab(QWidget):
         if self.machine_inputs_label is not None:
             self.machine_inputs_label.setText(text)
 
+    def set_estop_override_checked(self, checked: bool):
+        self.estop_override_active = checked
+        if self.estop_override_checkbox is None:
+            return
+
+        self.estop_override_checkbox.blockSignals(True)
+        self.estop_override_checkbox.setChecked(checked)
+        self.estop_override_checkbox.blockSignals(False)
+
+    def sync_estop_override_state(self):
+        if not self.command_transport_ready():
+            return
+
+        try:
+            response = self.send_raw_command("ESTOP_OVERRIDE")
+        except Exception as e:
+            self.log_signal.emit(f"E-stop override state unavailable: {e}")
+            self.set_estop_override_checked(False)
+            return
+
+        normalized = (response or "").strip().upper()
+        if normalized == "ESTOP_OVERRIDE:1":
+            self.set_estop_override_checked(True)
+        elif normalized == "ESTOP_OVERRIDE:0":
+            self.set_estop_override_checked(False)
+        else:
+            self.log_signal.emit(f"E-stop override state unavailable: {response}")
+            self.set_estop_override_checked(False)
+
+    def on_estop_override_toggled(self, checked: bool):
+        command = f"SET_ESTOP_OVERRIDE:{1 if checked else 0}"
+        previous = self.estop_override_active
+
+        if not self.command_transport_ready():
+            self.log_signal.emit("E-stop override skipped: no active ClearCore transport")
+            self.set_estop_override_checked(previous)
+            return
+
+        self.log_signal.emit(f"Command given -> {command}")
+        try:
+            response = self.route_command(command)
+            if self.response_has_error(response):
+                raise RuntimeError(response)
+
+            self.log_signal.emit(f"{command} -> {response}")
+            self.set_estop_override_checked(checked)
+
+            if checked:
+                self.log_signal.emit("Command given -> CLEAR_FAULTS")
+                clear_response = self.route_command("CLEAR_FAULTS")
+                if self.response_has_error(clear_response):
+                    self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {clear_response}")
+                else:
+                    self.log_signal.emit(f"CLEAR_FAULTS -> {clear_response}")
+
+            self.refresh_motor_statuses()
+            self.log_clearcore_diagnostics()
+        except Exception as e:
+            self.log_signal.emit(f"Command failed ({command}): {e}")
+            if checked:
+                self.log_signal.emit("Upload the updated ClearCore firmware to use E-stop override.")
+            self.set_estop_override_checked(previous)
+
     def send_pi_best_effort(self, command: str):
         self.log_signal.emit(f"Command given -> {command}")
         try:
@@ -330,7 +415,8 @@ class ManualTab(QWidget):
             self.set_machine_state("ready" if self.system_homed else "idle")
 
         summary = (
-            f"Inputs: estop={inputs.get('ESTOP', '?')} start={gpio_inputs.get('START', '?')} "
+            f"Inputs: estop={inputs.get('ESTOP', '?')} override={inputs.get('ESTOP_OVERRIDE', '?')} "
+            f"start={gpio_inputs.get('START', '?')} "
             f"stop={gpio_inputs.get('STOP', '?')} home={gpio_inputs.get('HOME', '?')} "
             f"m0_home={inputs.get('M0_HOME', '?')} m0_limit={inputs.get('M0_LIMIT', '?')} "
             f"m1_home={inputs.get('M1_HOME', '?')} m1_limit={inputs.get('M1_LIMIT', '?')}"
@@ -754,24 +840,62 @@ class ManualTab(QWidget):
                 self.set_motor_diag_text(motor_name, f"Diagnostics: status={status.upper()}")
                 if status != previous:
                     self.log_signal.emit(f"{motor_name} status -> {status.upper()}")
+                    if status == "fault":
+                        self.log_clearcore_diagnostics()
                 self.last_motor_status[motor_name] = status
             except Exception as e:
                 self.log_signal.emit(f"{motor_name} status check failed: {e}")
                 self.set_motor_status(motor_name, "off")
                 self.set_motor_diag_text(motor_name, "Diagnostics: status=ERROR")
 
-    def log_firmware_identity(self):
+    def read_clearcore_identity(self):
+        identity = {}
+        for command in ("CAPS", "VERSION", "PING_M0"):
+            try:
+                identity[command] = self.clearcore_client.send_command(command)
+            except Exception as e:
+                identity[command] = f"ERR {e}"
+        return identity
+
+    def is_clearcore_identity(self, identity):
+        if not identity:
+            return False
+        caps = (identity.get("CAPS") or "").strip().upper()
+        version = (identity.get("VERSION") or "").strip().upper()
+        ping_m0 = (identity.get("PING_M0") or "").strip().upper()
+        if caps.startswith("CAPS:ACTUATOR"):
+            return False
+        return (
+            (caps.startswith("CAPS:") and "M0" in caps)
+            or "CLEARCORE" in version
+            or ping_m0 == "PONG_M0"
+        )
+
+    def log_firmware_identity(self, identity=None):
         try:
-            version = self.send_raw_command("VERSION")
+            version = identity.get("VERSION") if identity is not None else self.send_raw_command("VERSION")
             self.log_signal.emit(f"ClearCore firmware: {version}")
         except Exception as e:
             self.log_signal.emit(f"ClearCore firmware version check failed: {e}")
 
         try:
-            caps = self.send_raw_command("CAPS")
+            caps = identity.get("CAPS") if identity is not None else None
+            if caps is None:
+                caps = self.send_raw_command("CAPS")
             self.log_signal.emit(f"ClearCore capabilities: {caps}")
         except Exception as e:
             self.log_signal.emit(f"ClearCore capability check failed: {e}")
+
+    def log_clearcore_diagnostics(self):
+        if not self.command_transport_ready():
+            return
+
+        for command in ("INPUTS", "CONTROLLER_STATE", "FAULTS", "ESTOP_OVERRIDE", "STATUS_M0", "STATUS_M1"):
+            try:
+                response = self.send_raw_command(command)
+                self.log_signal.emit(f"ClearCore diagnostic {command} -> {response}")
+            except Exception as e:
+                self.log_signal.emit(f"ClearCore diagnostic {command} failed: {e}")
 
     def send_raw_command(self, cmd: str):
         if self.mode_combo.currentData() == "local":
@@ -805,6 +929,8 @@ class ManualTab(QWidget):
             widget.setEnabled(self.mode_combo.currentData() == "local")
         for widget in self.arduino_diagnostic_widgets:
             widget.setEnabled(self.mode_combo.currentData() == "local" and self.arduino_connected)
+        if self.estop_override_checkbox is not None:
+            self.estop_override_checkbox.setEnabled(clearpath_enabled)
 
     def update_connection_label(self):
         mode = self.mode_combo.currentData()
@@ -828,9 +954,7 @@ class ManualTab(QWidget):
         ports = get_serial_ports()
         self.available_ports = ports
         for port in ports:
-            role = self.display_role_for_port(port)
-            detail = port.get("role_detail") or port["description"]
-            label = f"{port['device']} | {role} | {detail}"
+            label = self.port_label(port)
             self.port_combo.addItem(label, port["device"])
             self.arduino_port_combo.addItem(label, port["device"])
 
@@ -854,9 +978,7 @@ class ManualTab(QWidget):
         self.arduino_port_combo.clear()
 
         for port in getattr(self, "available_ports", []):
-            role = self.display_role_for_port(port)
-            detail = port.get("role_detail") or port["description"]
-            label = f"{port['device']} | {role} | {detail}"
+            label = self.port_label(port)
             self.port_combo.addItem(label, port["device"])
             self.arduino_port_combo.addItem(label, port["device"])
 
@@ -879,7 +1001,7 @@ class ManualTab(QWidget):
 
         self.refresh_ports(quiet=True)
         clearcore_port = self.find_preferred_port("ClearCore")
-        arduino_port = self.find_preferred_port("Arduino", exclude_devices={clearcore_port} if clearcore_port else None)
+        arduino_excluded = {clearcore_port} if clearcore_port else None
 
         if clearcore_port:
             index = self.port_combo.findData(clearcore_port)
@@ -887,9 +1009,12 @@ class ManualTab(QWidget):
                 self.port_combo.setCurrentIndex(index)
             self.log_signal.emit(f"Startup auto-connect: trying ClearCore on {clearcore_port}")
             self.connect_local_clearcore()
+            if not self.clearcore_connected:
+                arduino_excluded = None
         else:
             self.log_signal.emit("Startup auto-connect: no ClearCore port detected")
 
+        arduino_port = self.find_preferred_port("Arduino", exclude_devices=arduino_excluded)
         if arduino_port:
             index = self.arduino_port_combo.findData(arduino_port)
             if index >= 0:
@@ -926,14 +1051,7 @@ class ManualTab(QWidget):
         if not hasattr(self, "auto_retry_timer"):
             return
 
-        should_retry = (
-            self.mode_combo.currentData() == "local"
-            and (not self.clearcore_connected or not self.arduino_connected)
-        )
-
-        if should_retry and not self.auto_retry_timer.isActive():
-            self.auto_retry_timer.start()
-        elif not should_retry and self.auto_retry_timer.isActive():
+        if self.auto_retry_timer.isActive():
             self.auto_retry_timer.stop()
 
     def find_preferred_port(self, role: str, exclude_devices=None):
@@ -945,6 +1063,18 @@ class ManualTab(QWidget):
                 return port["device"]
         return None
 
+    def find_port_info(self, device: str):
+        for port in getattr(self, "available_ports", []):
+            if port.get("device") == device:
+                return port
+        return None
+
+    def baudrate_candidates(self, port_info):
+        baudrate = (port_info or {}).get("baudrate")
+        if baudrate:
+            return [baudrate]
+        return list(PROBE_BAUDRATES)
+
     def display_role_for_port(self, port_info):
         device = port_info["device"]
         if self.clearcore_connected and self.clearcore_client is not None and self.clearcore_client.port == device:
@@ -952,6 +1082,11 @@ class ManualTab(QWidget):
         if self.arduino_connected and self.arduino_client is not None and self.arduino_client.port == device:
             return "Arduino"
         return port_info.get("role", "Unknown")
+
+    def port_label(self, port_info):
+        role = self.display_role_for_port(port_info)
+        description = port_info.get("description") or "Serial port"
+        return f"{port_info['device']} | {role} | {description}"
 
     def connect_arduino(self, quiet: bool = False):
         port = self.arduino_port_combo.currentData()
@@ -971,8 +1106,15 @@ class ManualTab(QWidget):
             if self.arduino_client is not None:
                 self.arduino_client.disconnect()
 
-            self.arduino_client = ArduinoController(port=port)
-            if not self.arduino_client.connect():
+            port_info = self.find_port_info(port)
+            connected = False
+            for baudrate in self.baudrate_candidates(port_info):
+                self.arduino_client = ArduinoController(port=port, baudrate=baudrate)
+                connected = self.arduino_client.connect()
+                if connected:
+                    break
+                self.arduino_client = None
+            if not connected:
                 raise RuntimeError(f"Unable to open Arduino port {port}")
 
             self.set_arduino_connected(True)
@@ -1068,6 +1210,10 @@ class ManualTab(QWidget):
         self.connection_status = QLabel("Status: Local mode idle")
         self.machine_state_label = QLabel("Machine: IDLE")
         self.machine_inputs_label = QLabel("Inputs: unavailable")
+        self.estop_override_checkbox = QCheckBox("E-stop override")
+        self.estop_override_checkbox.setToolTip(
+            "Temporary integration mode: ignore the ClearCore E-stop input."
+        )
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh Ports")
         set_port_btn = QPushButton("Use Selected Port")
@@ -1077,6 +1223,7 @@ class ManualTab(QWidget):
         disconnect_btn.clicked.connect(self.disconnect_all)
         refresh_btn.clicked.connect(self.refresh_ports)
         set_port_btn.clicked.connect(self.set_clearcore_port)
+        self.estop_override_checkbox.toggled.connect(self.on_estop_override_toggled)
 
         grid.addWidget(QLabel("Connection Mode:"), 0, 0)
         grid.addWidget(self.mode_combo, 0, 1, 1, 2)
@@ -1085,10 +1232,11 @@ class ManualTab(QWidget):
         grid.addWidget(self.connection_status, 2, 0, 1, 3)
         grid.addWidget(self.machine_state_label, 3, 0, 1, 3)
         grid.addWidget(self.machine_inputs_label, 4, 0, 1, 3)
-        grid.addWidget(QLabel("Detected Ports:"), 5, 0)
-        grid.addWidget(self.port_combo, 5, 1, 1, 2)
-        grid.addWidget(refresh_btn, 6, 0)
-        grid.addWidget(set_port_btn, 6, 1)
+        grid.addWidget(self.estop_override_checkbox, 5, 0, 1, 3)
+        grid.addWidget(QLabel("Detected Ports:"), 6, 0)
+        grid.addWidget(self.port_combo, 6, 1, 1, 2)
+        grid.addWidget(refresh_btn, 7, 0)
+        grid.addWidget(set_port_btn, 7, 1)
 
         return box
 

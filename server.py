@@ -4,14 +4,66 @@ from controllers.actuator_controller import ActuatorController
 from controllers.clearcore_controller import ClearCoreController
 from utils.config_manager import load_config
 from utils.pi_gpio import PiGpioManager
+from utils.serial_ports import get_serial_ports, probe_serial_port
 
 HOST = "0.0.0.0"
 PORT = 5000
 
 config = load_config()
-clearcore = ClearCoreController(port=config["clearcore_port"])
-actuator = ActuatorController(port=config["arduino_port"])
 gpio = PiGpioManager(config)
+serial_roles = {}
+
+
+def is_clearcore_role(role: str) -> bool:
+    return role == "ClearCore"
+
+
+def is_actuator_role(role: str) -> bool:
+    return role == "Arduino"
+
+
+def probe_role(port: str):
+    for port_info in get_serial_ports():
+        if port_info.get("device") == port:
+            role = port_info.get("role", "Unknown")
+            detail = port_info.get("role_detail", "")
+            baudrate = port_info.get("baudrate")
+            if role != "Unknown":
+                serial_roles[port] = (role, detail, baudrate)
+                return role, detail, baudrate
+
+    role, detail, baudrate = probe_serial_port(port)
+    serial_roles[port] = (role, detail, baudrate)
+    return role, detail, baudrate
+
+
+def configure_serial_controllers():
+    clearcore_port = config["clearcore_port"]
+    actuator_port = config["arduino_port"]
+
+    clearcore_role, clearcore_detail, clearcore_baudrate = probe_role(clearcore_port)
+    actuator_role, actuator_detail, actuator_baudrate = probe_role(actuator_port)
+
+    if is_actuator_role(clearcore_role) and is_clearcore_role(actuator_role):
+        print(
+            "Configured serial ports appear swapped; using "
+            f"ClearCore={actuator_port} and Arduino={clearcore_port}"
+        )
+        clearcore_port, actuator_port = actuator_port, clearcore_port
+        clearcore_role, actuator_role = actuator_role, clearcore_role
+        clearcore_detail, actuator_detail = actuator_detail, clearcore_detail
+        clearcore_baudrate, actuator_baudrate = actuator_baudrate, clearcore_baudrate
+
+    print(f"ClearCore port probe: {clearcore_port} -> {clearcore_role} ({clearcore_detail})")
+    print(f"Arduino port probe: {actuator_port} -> {actuator_role} ({actuator_detail})")
+
+    return (
+        ClearCoreController(port=clearcore_port, baudrate=clearcore_baudrate or 9600),
+        ActuatorController(port=actuator_port, baudrate=actuator_baudrate or 9600),
+    )
+
+
+clearcore, actuator = configure_serial_controllers()
 
 
 def is_actuator_command(cmd: str) -> bool:
@@ -57,6 +109,24 @@ def handle_gpio_command(cmd: str):
     return None
 
 
+def serial_ports_summary() -> str:
+    parts = []
+    for port in get_serial_ports():
+        parts.append(
+            f"{port['device']}={port.get('role', 'Unknown')}({port.get('role_detail', '')})"
+        )
+    return "SERIAL_PORTS:" + (";".join(parts) if parts else "none")
+
+
+def validate_controller_role(controller, expected_role: str):
+    role, detail, _baudrate = serial_roles.get(controller.port, ("Unknown", "not probed", None))
+    if expected_role == "ClearCore" and not is_clearcore_role(role):
+        return f"ERR CLEARCORE_PORT_MISMATCH {controller.port} role={role} detail={detail}"
+    if expected_role == "Arduino" and not is_actuator_role(role):
+        return f"ERR ARDUINO_PORT_MISMATCH {controller.port} role={role} detail={detail}"
+    return None
+
+
 def handle_command(cmd: str) -> str:
     global clearcore, actuator
 
@@ -68,34 +138,50 @@ def handle_command(cmd: str) -> str:
     if cmd == "GPIO_CONFIG":
         return gpio.config_summary()
 
+    if cmd == "SERIAL_PORTS":
+        return serial_ports_summary()
+
     gpio_response = handle_gpio_command(cmd)
     if gpio_response is not None:
         return gpio_response
 
     if cmd.startswith("SET_CLEARCORE_PORT:"):
         port = cmd.split(":", 1)[1].strip()
+        role, detail, baudrate = probe_role(port)
+        if not is_clearcore_role(role):
+            return f"ERR CLEARCORE_PORT_MISMATCH {port} role={role} detail={detail}"
         try:
             clearcore.close()
         except Exception:
             pass
 
-        clearcore = ClearCoreController(port=port)
+        clearcore = ClearCoreController(port=port, baudrate=baudrate or 9600)
         return f"OK SET_CLEARCORE_PORT {port}"
 
     if cmd.startswith("SET_ARDUINO_PORT:"):
         port = cmd.split(":", 1)[1].strip()
+        role, detail, baudrate = probe_role(port)
+        if not is_actuator_role(role):
+            return f"ERR ARDUINO_PORT_MISMATCH {port} role={role} detail={detail}"
         try:
             actuator.close()
         except Exception:
             pass
 
-        actuator = ActuatorController(port=port)
+        actuator = ActuatorController(port=port, baudrate=baudrate or 9600)
         return f"OK SET_ARDUINO_PORT {port}"
 
     if is_actuator_command(cmd):
+        mismatch = validate_controller_role(actuator, "Arduino")
+        if mismatch is not None:
+            return mismatch
         response = actuator.send_command(cmd)
         print(f"Actuator response: {response}")
         return response
+
+    mismatch = validate_controller_role(clearcore, "ClearCore")
+    if mismatch is not None:
+        return mismatch
 
     response = clearcore.send_command(cmd)
     print(f"ClearCore response: {response}")
