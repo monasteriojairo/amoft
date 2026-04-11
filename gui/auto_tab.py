@@ -425,6 +425,7 @@ class AutoTab(QWidget):
         self.advance_sequence()
 
     def start_from_hardware(self):
+        self.log_signal.emit("Auto: Hardware START received")
         if not self.sequence_steps:
             self.log_signal.emit("Auto: Hardware START ignored because no queue is loaded")
             self.cycle_state_signal.emit("idle")

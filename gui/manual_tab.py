@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
 from controllers.arduino_controller import ArduinoController
 from controllers.clearcore_controller import ClearCoreController
 from controllers.pi_client import PiClient
+from utils.config_manager import load_config
+from utils.pi_gpio import PiGpioManager
 from utils.serial_ports import PROBE_BAUDRATES, get_serial_ports
 
 
@@ -26,6 +28,7 @@ class ManualTab(QWidget):
         self.pi_client = PiClient(host="192.168.1.95", port=5000)
         self.clearcore_client = None
         self.arduino_client = None
+        self.local_gpio = PiGpioManager(load_config())
         self.pi_connected = False
         self.clearcore_connected = False
         self.arduino_connected = False
@@ -96,6 +99,7 @@ class ManualTab(QWidget):
         self.auto_retry_timer.setInterval(5000)
         self.auto_retry_timer.timeout.connect(self.auto_retry_devices)
         self.update_auto_retry_timer()
+        self.update_supervisor_timer()
         QTimer.singleShot(0, self.auto_connect_startup_devices)
 
     def connect_selected_mode(self):
@@ -118,7 +122,7 @@ class ManualTab(QWidget):
                 serial_ports = self.pi_client.send("SERIAL_PORTS")
                 self.log_signal.emit(serial_ports)
                 self.status_timer.start()
-                self.supervisor_timer.start()
+                self.update_supervisor_timer()
                 self.sync_estop_override_state()
                 self.sync_limit_override_state()
                 self.refresh_supervisor_snapshot()
@@ -127,7 +131,7 @@ class ManualTab(QWidget):
             self.pi_connected = False
             self.set_pi_connected(False)
             self.status_timer.stop()
-            self.supervisor_timer.stop()
+            self.update_supervisor_timer()
             self.log_signal.emit(f"Pi connection failed: {e}")
             self.update_connection_label()
 
@@ -171,6 +175,9 @@ class ManualTab(QWidget):
             self.set_clearcore_connected(True)
             self.set_motor_status("M0", "disabled")
             self.set_motor_status("M1", "disabled")
+            if self.local_gpio.enabled:
+                self.log_signal.emit(f"Local {self.local_gpio.config_summary()}")
+            self.update_supervisor_timer()
             self.sync_estop_override_state()
             self.sync_limit_override_state()
             self.log_clearcore_diagnostics()
@@ -182,6 +189,7 @@ class ManualTab(QWidget):
             self.set_motor_status("M0", "off")
             self.set_motor_status("M1", "off")
             self.status_timer.stop()
+            self.update_supervisor_timer()
             if not quiet:
                 self.log_signal.emit(f"ClearCore connection failed: {e}")
             self.update_connection_label()
@@ -212,7 +220,7 @@ class ManualTab(QWidget):
         self.set_motor_status("M0", "off")
         self.set_motor_status("M1", "off")
         self.status_timer.stop()
-        self.supervisor_timer.stop()
+        self.update_supervisor_timer()
         self.home_timer.stop()
         self.home_sequence_active = False
         self.set_machine_state("idle")
@@ -417,9 +425,12 @@ class ManualTab(QWidget):
             self.set_limit_override_checked(previous)
 
     def send_pi_best_effort(self, command: str):
+        return self.send_machine_best_effort(command)
+
+    def send_machine_best_effort(self, command: str):
         self.log_signal.emit(f"Command given -> {command}")
         try:
-            response = self.pi_client.send(command)
+            response = self.route_command(command)
             self.log_signal.emit(f"{command} -> {response}")
             return response
         except Exception as e:
@@ -432,34 +443,68 @@ class ManualTab(QWidget):
         self.update_clearcore_leds()
 
     def poll_supervisor_state(self):
-        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+        mode = self.mode_combo.currentData()
+        if mode == "pi":
+            if not self.pi_connected:
+                return
+
+            self.refresh_supervisor_snapshot()
+
+            try:
+                event_response = self.pi_client.send("GPIO_EVENTS")
+            except Exception as e:
+                self.log_signal.emit(f"Supervisor event poll failed: {e}")
+                self.set_pi_connected(False)
+                self.update_supervisor_timer()
+                return
+
+            if event_response == "EVENT:NONE":
+                return
+
+            if event_response.startswith("EVENT:"):
+                self.log_signal.emit(f"GPIO event poll -> {event_response}")
+                self.handle_clearcore_event(event_response.split(":", 1)[1].strip())
             return
 
-        self.refresh_supervisor_snapshot()
+        if mode != "local" or not self.local_gpio.available:
+            return
 
         try:
-            event_response = self.pi_client.send("GPIO_EVENTS")
+            self.refresh_supervisor_snapshot()
+            event_name = self.local_gpio.get_event()
         except Exception as e:
-            self.log_signal.emit(f"Supervisor event poll failed: {e}")
-            self.set_pi_connected(False)
-            self.supervisor_timer.stop()
+            self.log_signal.emit(f"Local GPIO poll failed: {e}")
             return
 
-        if event_response == "EVENT:NONE":
+        if event_name == "NONE":
             return
 
-        if event_response.startswith("EVENT:"):
-            self.log_signal.emit(f"GPIO event poll -> {event_response}")
-            self.handle_clearcore_event(event_response.split(":", 1)[1].strip())
+        event_response = f"EVENT:{event_name}"
+        self.log_signal.emit(f"GPIO event poll -> {event_response}")
+        self.handle_clearcore_event(event_name)
 
     def update_supervisor_inputs(self):
-        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
-            return
+        mode = self.mode_combo.currentData()
 
         try:
-            gpio_input_response = self.pi_client.send("GPIO_INPUTS")
-            clearcore_input_response = self.pi_client.send("INPUTS")
-            controller_response = self.pi_client.send("CONTROLLER_STATE")
+            if mode == "pi":
+                if not self.pi_connected:
+                    return
+                gpio_input_response = self.pi_client.send("GPIO_INPUTS")
+                clearcore_input_response = self.pi_client.send("INPUTS")
+                controller_response = self.pi_client.send("CONTROLLER_STATE")
+            elif mode == "local":
+                if not self.local_gpio.available:
+                    return
+                gpio_input_response = self.local_gpio.input_summary()
+                if self.command_transport_ready():
+                    clearcore_input_response = self.send_raw_command("INPUTS")
+                    controller_response = self.send_raw_command("CONTROLLER_STATE")
+                else:
+                    clearcore_input_response = "INPUTS:"
+                    controller_response = "CONTROLLER_STATE:"
+            else:
+                return
         except Exception as e:
             self.log_signal.emit(f"Supervisor input poll failed: {e}")
             return
@@ -498,11 +543,11 @@ class ManualTab(QWidget):
         self.set_machine_inputs_text(summary)
 
     def update_actuator_supervisor_status(self):
-        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
+        if not self.actuator_transport_ready():
             return
 
         try:
-            actuator_status = self.pi_client.send("STATUS_ACTUATOR")
+            actuator_status = self.route_command("STATUS_ACTUATOR")
         except Exception:
             return
 
@@ -516,9 +561,6 @@ class ManualTab(QWidget):
                 self.set_machine_state("faulted")
 
     def update_clearcore_leds(self):
-        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
-            return
-
         ready = int(self.machine_state == "ready")
         running = int(self.machine_state in {"running", "homing", "actuator_retracting"})
         fault = int(self.machine_state in {"faulted", "estop_active"})
@@ -527,7 +569,14 @@ class ManualTab(QWidget):
             return
 
         try:
-            self.pi_client.send(f"GPIO_SET_LEDS:{ready},{running},{fault}")
+            if self.mode_combo.currentData() == "pi":
+                if not self.pi_connected:
+                    return
+                self.pi_client.send(f"GPIO_SET_LEDS:{ready},{running},{fault}")
+            elif self.local_gpio.available:
+                self.local_gpio.set_leds(bool(ready), bool(running), bool(fault))
+            else:
+                return
             self.last_led_state = led_state
         except Exception as e:
             self.log_signal.emit(f"LED update failed: {e}")
@@ -543,6 +592,12 @@ class ManualTab(QWidget):
             self.handle_hardware_home()
 
     def handle_hardware_start(self):
+        self.log_signal.emit(
+            "Hardware START gate -> "
+            f"estop={int(self.estop_active)} "
+            f"faulted={int(self.system_faulted)} "
+            f"homed={int(self.system_homed)}"
+        )
         if self.estop_active:
             self.log_signal.emit("Hardware START rejected: E-stop active")
             self.set_machine_state("estop_active")
@@ -551,18 +606,15 @@ class ManualTab(QWidget):
             self.log_signal.emit("Hardware START rejected: system faulted")
             self.set_machine_state("faulted")
             return
-        if not self.system_homed:
-            self.log_signal.emit("Hardware START rejected: system not homed")
-            self.set_machine_state("idle")
-            return
 
+        self.log_signal.emit("Hardware START accepted: requesting auto queue start")
         self.set_machine_state("running")
         self.hardware_start_requested.emit()
 
     def handle_hardware_stop(self):
         self.hardware_stop_requested.emit()
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
-            self.send_pi_best_effort(command)
+            self.send_machine_best_effort(command)
         if self.estop_active:
             self.set_machine_state("estop_active")
         else:
@@ -579,8 +631,8 @@ class ManualTab(QWidget):
         self.start_home_sequence()
 
     def start_home_sequence(self):
-        self.send_pi_best_effort("CLEAR_FAULTS")
-        self.send_pi_best_effort("CLEAR_FAULT")
+        self.send_machine_best_effort("CLEAR_FAULTS")
+        self.send_machine_best_effort("CLEAR_FAULT")
         self.home_sequence_active = True
         self.system_faulted = False
         self.system_homed = False
@@ -589,7 +641,7 @@ class ManualTab(QWidget):
         self.set_machine_state("actuator_retracting")
 
         try:
-            response = self.pi_client.send("HOME_ACTUATOR")
+            response = self.route_command("HOME_ACTUATOR")
         except Exception as e:
             self.fail_home_sequence(f"Actuator home command failed: {e}")
             return
@@ -602,14 +654,14 @@ class ManualTab(QWidget):
         self.home_timer.start()
 
     def advance_home_sequence(self):
-        if self.mode_combo.currentData() != "pi" or not self.pi_connected:
-            self.fail_home_sequence("Pi link unavailable during homing")
+        if not self.command_transport_ready() or not self.actuator_transport_ready():
+            self.fail_home_sequence("Hardware link unavailable during homing")
             return
 
         if self.home_step == "actuator_retract":
             self.home_poll_attempts += 1
             try:
-                status = self.pi_client.send("STATUS_ACTUATOR").strip().upper()
+                status = self.route_command("STATUS_ACTUATOR").strip().upper()
             except Exception as e:
                 self.fail_home_sequence(f"Actuator status poll failed: {e}")
                 return
@@ -626,7 +678,7 @@ class ManualTab(QWidget):
 
         if self.home_step == "servo_m0":
             try:
-                response = self.pi_client.send("HOME_M0")
+                response = self.route_command("HOME_M0")
             except Exception as e:
                 self.fail_home_sequence(f"M0 home command failed: {e}")
                 return
@@ -639,7 +691,7 @@ class ManualTab(QWidget):
 
         if self.home_step == "servo_m1":
             try:
-                response = self.pi_client.send("HOME_M1")
+                response = self.route_command("HOME_M1")
             except Exception as e:
                 self.fail_home_sequence(f"M1 home command failed: {e}")
                 return
@@ -656,7 +708,7 @@ class ManualTab(QWidget):
         self.system_faulted = True
         self.system_homed = False
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
-            self.send_pi_best_effort(command)
+            self.send_machine_best_effort(command)
         self.set_machine_state("faulted")
         self.log_signal.emit(message)
 
@@ -784,6 +836,7 @@ class ManualTab(QWidget):
         self.pi_connected = connected
         self.pi_connection_signal.emit(connected)
         self.update_auto_retry_timer()
+        self.update_supervisor_timer()
         self.update_connection_controls()
 
     def set_clearcore_connected(self, connected: bool):
@@ -791,6 +844,7 @@ class ManualTab(QWidget):
         self.clearcore_connection_signal.emit(connected)
         self.refresh_port_labels()
         self.update_auto_retry_timer()
+        self.update_supervisor_timer()
         if connected:
             self.set_motor_diag_text("M0", "Diagnostics: connected")
             self.set_motor_diag_text("M1", "Diagnostics: connected")
@@ -807,6 +861,7 @@ class ManualTab(QWidget):
             self.arduino_status_label.setText(text)
         self.refresh_port_labels()
         self.update_auto_retry_timer()
+        self.update_supervisor_timer()
         self.update_connection_controls()
 
     def set_motor_status(self, motor_name: str, status: str):
@@ -1082,6 +1137,12 @@ class ManualTab(QWidget):
         self.arduino_port_combo.blockSignals(False)
 
     def auto_connect_startup_devices(self):
+        try:
+            self._auto_connect_startup_devices()
+        except Exception as e:
+            self.log_signal.emit(f"Startup auto-connect error: {e}")
+
+    def _auto_connect_startup_devices(self):
         if self.mode_combo.currentData() != "local":
             return
 
@@ -1139,6 +1200,21 @@ class ManualTab(QWidget):
 
         if self.auto_retry_timer.isActive():
             self.auto_retry_timer.stop()
+
+    def update_supervisor_timer(self):
+        if not hasattr(self, "supervisor_timer") or not hasattr(self, "mode_combo"):
+            return
+
+        mode = self.mode_combo.currentData()
+        should_poll = (
+            (mode == "pi" and self.pi_connected)
+            or (mode == "local" and self.local_gpio.available)
+        )
+
+        if should_poll and not self.supervisor_timer.isActive():
+            self.supervisor_timer.start()
+        elif not should_poll and self.supervisor_timer.isActive():
+            self.supervisor_timer.stop()
 
     def find_preferred_port(self, role: str, exclude_devices=None):
         excluded = exclude_devices or set()
@@ -1284,6 +1360,24 @@ class ManualTab(QWidget):
 
             self.send_command(f"SET_CLEARCORE_PORT:{port}")
 
+    def check_gpio_buttons(self):
+        mode = self.mode_combo.currentData()
+        if mode == "pi":
+            if not self.pi_connected:
+                self.log_signal.emit("GPIO check skipped: Pi Bridge is not connected")
+                return
+
+            for command in ("GPIO_CONFIG", "GPIO_INPUTS"):
+                try:
+                    response = self.pi_client.send(command)
+                    self.log_signal.emit(f"GPIO check {command} -> {response}")
+                except Exception as e:
+                    self.log_signal.emit(f"GPIO check failed ({command}): {e}")
+            return
+
+        self.log_signal.emit(f"GPIO check GPIO_CONFIG -> {self.local_gpio.config_summary()}")
+        self.log_signal.emit(f"GPIO check GPIO_INPUTS -> {self.local_gpio.input_summary()}")
+
     def create_connection_group(self):
         box = QGroupBox("Connection / Ports")
         grid = QGridLayout(box)
@@ -1307,12 +1401,14 @@ class ManualTab(QWidget):
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh Ports")
         set_port_btn = QPushButton("Use Selected Port")
+        gpio_check_btn = QPushButton("Check GPIO Buttons")
 
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.connect_btn.clicked.connect(self.connect_selected_mode)
         disconnect_btn.clicked.connect(self.disconnect_all)
         refresh_btn.clicked.connect(self.refresh_ports)
         set_port_btn.clicked.connect(self.set_clearcore_port)
+        gpio_check_btn.clicked.connect(self.check_gpio_buttons)
         self.estop_override_checkbox.toggled.connect(self.on_estop_override_toggled)
         self.limit_override_checkbox.toggled.connect(self.on_limit_override_toggled)
 
@@ -1325,20 +1421,21 @@ class ManualTab(QWidget):
         grid.addWidget(self.machine_inputs_label, 4, 0, 1, 3)
         grid.addWidget(self.estop_override_checkbox, 5, 0, 1, 3)
         grid.addWidget(self.limit_override_checkbox, 6, 0, 1, 3)
-        grid.addWidget(QLabel("Detected Ports:"), 7, 0)
-        grid.addWidget(self.port_combo, 7, 1, 1, 2)
-        grid.addWidget(refresh_btn, 8, 0)
-        grid.addWidget(set_port_btn, 8, 1)
+        grid.addWidget(gpio_check_btn, 7, 0, 1, 3)
+        grid.addWidget(QLabel("Detected Ports:"), 8, 0)
+        grid.addWidget(self.port_combo, 8, 1, 1, 2)
+        grid.addWidget(refresh_btn, 9, 0)
+        grid.addWidget(set_port_btn, 9, 1)
 
         return box
 
     def on_mode_changed(self):
         self.update_connection_label()
         if self.mode_combo.currentData() != "pi":
-            self.supervisor_timer.stop()
             self.home_timer.stop()
             self.home_sequence_active = False
             self.set_machine_state("idle")
+        self.update_supervisor_timer()
         self.log_signal.emit(f"Connection mode set to: {self.mode_combo.currentText()}")
 
     def create_arduino_group(self):
