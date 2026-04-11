@@ -48,7 +48,9 @@ class ManualTab(QWidget):
         self.machine_state_label = None
         self.machine_inputs_label = None
         self.estop_override_checkbox = None
+        self.limit_override_checkbox = None
         self.estop_override_active = False
+        self.limit_override_active = False
         self.last_motor_status = {"M0": "off", "M1": "off"}
         self.machine_state = "idle"
         self.system_homed = False
@@ -118,6 +120,7 @@ class ManualTab(QWidget):
                 self.status_timer.start()
                 self.supervisor_timer.start()
                 self.sync_estop_override_state()
+                self.sync_limit_override_state()
                 self.refresh_supervisor_snapshot()
             self.update_connection_label()
         except Exception as e:
@@ -169,6 +172,7 @@ class ManualTab(QWidget):
             self.set_motor_status("M0", "disabled")
             self.set_motor_status("M1", "disabled")
             self.sync_estop_override_state()
+            self.sync_limit_override_state()
             self.log_clearcore_diagnostics()
             self.status_timer.start()
             self.update_connection_label()
@@ -219,18 +223,6 @@ class ManualTab(QWidget):
         self.log_signal.emit(f"Command given -> {cmd}")
         try:
             response = self.route_command(cmd)
-
-            if self.response_has_error(response):
-                raise RuntimeError(response)
-
-            self.update_motor_status_from_command(cmd)
-            self.update_motor_diagnostics_from_response(cmd, response)
-            self.update_actuator_status_from_command(cmd, response)
-            self.schedule_actuator_diagnostics(cmd)
-            if not cmd.startswith("PING"):
-                self.refresh_motor_statuses()
-
-            self.log_signal.emit(f"{cmd} -> {response}")
         except Exception as e:
             if self.mode_combo.currentData() == "local" and not self.is_actuator_command(cmd):
                 self.clearcore_client = None
@@ -253,6 +245,24 @@ class ManualTab(QWidget):
                 self.set_pi_connected(False)
 
             self.update_connection_label()
+            return
+
+        if self.response_has_error(response):
+            self.log_signal.emit(f"Command failed ({cmd}): {response}")
+            if self.is_actuator_command(cmd):
+                self.schedule_actuator_diagnostics(cmd)
+            else:
+                self.log_clearcore_diagnostics()
+            return
+
+        self.update_motor_status_from_command(cmd)
+        self.update_motor_diagnostics_from_response(cmd, response)
+        self.update_actuator_status_from_command(cmd, response)
+        self.schedule_actuator_diagnostics(cmd)
+        if not cmd.startswith("PING"):
+            self.refresh_motor_statuses()
+
+        self.log_signal.emit(f"{cmd} -> {response}")
 
     def parse_csv_response(self, response: str, prefix: str):
         if response is None:
@@ -289,6 +299,15 @@ class ManualTab(QWidget):
         self.estop_override_checkbox.setChecked(checked)
         self.estop_override_checkbox.blockSignals(False)
 
+    def set_limit_override_checked(self, checked: bool):
+        self.limit_override_active = checked
+        if self.limit_override_checkbox is None:
+            return
+
+        self.limit_override_checkbox.blockSignals(True)
+        self.limit_override_checkbox.setChecked(checked)
+        self.limit_override_checkbox.blockSignals(False)
+
     def sync_estop_override_state(self):
         if not self.command_transport_ready():
             return
@@ -308,6 +327,26 @@ class ManualTab(QWidget):
         else:
             self.log_signal.emit(f"E-stop override state unavailable: {response}")
             self.set_estop_override_checked(False)
+
+    def sync_limit_override_state(self):
+        if not self.command_transport_ready():
+            return
+
+        try:
+            response = self.send_raw_command("LIMIT_OVERRIDE")
+        except Exception as e:
+            self.log_signal.emit(f"Limit override state unavailable: {e}")
+            self.set_limit_override_checked(False)
+            return
+
+        normalized = (response or "").strip().upper()
+        if normalized == "LIMIT_OVERRIDE:1":
+            self.set_limit_override_checked(True)
+        elif normalized == "LIMIT_OVERRIDE:0":
+            self.set_limit_override_checked(False)
+        else:
+            self.log_signal.emit(f"Limit override state unavailable: {response}")
+            self.set_limit_override_checked(False)
 
     def on_estop_override_toggled(self, checked: bool):
         command = f"SET_ESTOP_OVERRIDE:{1 if checked else 0}"
@@ -342,6 +381,40 @@ class ManualTab(QWidget):
             if checked:
                 self.log_signal.emit("Upload the updated ClearCore firmware to use E-stop override.")
             self.set_estop_override_checked(previous)
+
+    def on_limit_override_toggled(self, checked: bool):
+        command = f"SET_LIMIT_OVERRIDE:{1 if checked else 0}"
+        previous = self.limit_override_active
+
+        if not self.command_transport_ready():
+            self.log_signal.emit("Limit override skipped: no active ClearCore transport")
+            self.set_limit_override_checked(previous)
+            return
+
+        self.log_signal.emit(f"Command given -> {command}")
+        try:
+            response = self.route_command(command)
+            if self.response_has_error(response):
+                raise RuntimeError(response)
+
+            self.log_signal.emit(f"{command} -> {response}")
+            self.set_limit_override_checked(checked)
+
+            if checked:
+                self.log_signal.emit("Command given -> CLEAR_FAULTS")
+                clear_response = self.route_command("CLEAR_FAULTS")
+                if self.response_has_error(clear_response):
+                    self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {clear_response}")
+                else:
+                    self.log_signal.emit(f"CLEAR_FAULTS -> {clear_response}")
+
+            self.refresh_motor_statuses()
+            self.log_clearcore_diagnostics()
+        except Exception as e:
+            self.log_signal.emit(f"Command failed ({command}): {e}")
+            if checked:
+                self.log_signal.emit("Upload the updated ClearCore firmware to use limit override.")
+            self.set_limit_override_checked(previous)
 
     def send_pi_best_effort(self, command: str):
         self.log_signal.emit(f"Command given -> {command}")
@@ -416,6 +489,7 @@ class ManualTab(QWidget):
 
         summary = (
             f"Inputs: estop={inputs.get('ESTOP', '?')} override={inputs.get('ESTOP_OVERRIDE', '?')} "
+            f"limit_override={inputs.get('LIMIT_OVERRIDE', '?')} "
             f"start={gpio_inputs.get('START', '?')} "
             f"stop={gpio_inputs.get('STOP', '?')} home={gpio_inputs.get('HOME', '?')} "
             f"m0_home={inputs.get('M0_HOME', '?')} m0_limit={inputs.get('M0_LIMIT', '?')} "
@@ -890,7 +964,17 @@ class ManualTab(QWidget):
         if not self.command_transport_ready():
             return
 
-        for command in ("INPUTS", "CONTROLLER_STATE", "FAULTS", "ESTOP_OVERRIDE", "STATUS_M0", "STATUS_M1"):
+        for command in (
+            "INPUTS",
+            "CONTROLLER_STATE",
+            "FAULTS",
+            "ESTOP_OVERRIDE",
+            "LIMIT_OVERRIDE",
+            "LIMITS_M0",
+            "LIMITS_M1",
+            "STATUS_M0",
+            "STATUS_M1",
+        ):
             try:
                 response = self.send_raw_command(command)
                 self.log_signal.emit(f"ClearCore diagnostic {command} -> {response}")
@@ -931,6 +1015,8 @@ class ManualTab(QWidget):
             widget.setEnabled(self.mode_combo.currentData() == "local" and self.arduino_connected)
         if self.estop_override_checkbox is not None:
             self.estop_override_checkbox.setEnabled(clearpath_enabled)
+        if self.limit_override_checkbox is not None:
+            self.limit_override_checkbox.setEnabled(clearpath_enabled)
 
     def update_connection_label(self):
         mode = self.mode_combo.currentData()
@@ -1214,6 +1300,10 @@ class ManualTab(QWidget):
         self.estop_override_checkbox.setToolTip(
             "Temporary integration mode: ignore the ClearCore E-stop input."
         )
+        self.limit_override_checkbox = QCheckBox("Limit/home override")
+        self.limit_override_checkbox.setToolTip(
+            "Temporary integration mode: ignore ClearCore home and limit inputs."
+        )
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh Ports")
         set_port_btn = QPushButton("Use Selected Port")
@@ -1224,6 +1314,7 @@ class ManualTab(QWidget):
         refresh_btn.clicked.connect(self.refresh_ports)
         set_port_btn.clicked.connect(self.set_clearcore_port)
         self.estop_override_checkbox.toggled.connect(self.on_estop_override_toggled)
+        self.limit_override_checkbox.toggled.connect(self.on_limit_override_toggled)
 
         grid.addWidget(QLabel("Connection Mode:"), 0, 0)
         grid.addWidget(self.mode_combo, 0, 1, 1, 2)
@@ -1233,10 +1324,11 @@ class ManualTab(QWidget):
         grid.addWidget(self.machine_state_label, 3, 0, 1, 3)
         grid.addWidget(self.machine_inputs_label, 4, 0, 1, 3)
         grid.addWidget(self.estop_override_checkbox, 5, 0, 1, 3)
-        grid.addWidget(QLabel("Detected Ports:"), 6, 0)
-        grid.addWidget(self.port_combo, 6, 1, 1, 2)
-        grid.addWidget(refresh_btn, 7, 0)
-        grid.addWidget(set_port_btn, 7, 1)
+        grid.addWidget(self.limit_override_checkbox, 6, 0, 1, 3)
+        grid.addWidget(QLabel("Detected Ports:"), 7, 0)
+        grid.addWidget(self.port_combo, 7, 1, 1, 2)
+        grid.addWidget(refresh_btn, 8, 0)
+        grid.addWidget(set_port_btn, 8, 1)
 
         return box
 
