@@ -65,11 +65,6 @@ void loop() {
       if (motionState == FAULTED) {
         Serial.println("ERR FAULTED");
       }
-      else if (retractConfirmActive()) {
-        stopMotor();
-        motionState = IDLE;
-        Serial.println("DONE RETRACT");
-      }
       else {
         startRetract();
         Serial.println("STARTED RETRACT");
@@ -190,13 +185,10 @@ void updateMotion() {
     Serial.println("DONE EXTEND");
   }
   else if (motionState == RETRACTING) {
-    if (retractConfirmActive()) {
+    if (now - motionStartedAt >= retractTime) {
       stopMotor();
       motionState = IDLE;
       Serial.println("DONE RETRACT");
-    }
-    else if (now - motionStartedAt >= retractTime) {
-      faultStop("RETRACT_TIMEOUT", "ERR RETRACT TIMEOUT");
     }
   }
   else if (motionState == HOMING_RETRACTING) {
