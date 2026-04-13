@@ -4,15 +4,15 @@
 #define motor0 ConnectorM0
 #define motor1 ConnectorM1
 
-// ClearCore now owns only safety/status inputs for the servos.
-#define estopStatus ConnectorDI6
+// ClearCore owns servo safety/status inputs. IO-0 watches the E-stop OK signal.
+#define estopStatus ConnectorIO0
 #define m0HomeSwitch ConnectorDI7
 #define m0LimitSwitch ConnectorDI8
 #define m1HomeSwitch ConnectorA9
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v6"
+#define firmwareVersion "clearcore-dual-motor-v7"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -136,7 +136,7 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "PING_M0") return "PONG_M0";
     if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
-    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_OVERRIDE,LIMIT_OVERRIDE";
+    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,ESTOP_OVERRIDE,LIMIT_OVERRIDE";
     if (cmd == "INPUTS") return InputSummary();
     if (cmd == "CONTROLLER_STATE") return ControllerStateSummary();
     if (cmd == "FAULTS") return FaultSummary();
@@ -174,6 +174,14 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "HOME_M0") return HomeMotorM0() ? "OK HOME_M0" : "ERR HOME_M0";
     if (cmd == "HOME_STATUS_M0") return HomeStatusM0();
     if (cmd == "LIMITS_M0") return LimitStatusM0();
+    if (cmd == "MARK_HOMED_M0" || cmd == "SET_HOME_M0:1") {
+        motor0Homed = true;
+        return "OK MARK_HOMED_M0";
+    }
+    if (cmd == "RESET_HOME_M0" || cmd == "SET_HOME_M0:0") {
+        motor0Homed = false;
+        return "OK RESET_HOME_M0";
+    }
     if (cmd == "ENABLE_M1") return EnableMotorM1() ? "OK ENABLE_M1" : "ERR ENABLE_M1";
     if (cmd == "DISABLE_M1") return DisableMotorM1() ? "OK DISABLE_M1" : "ERR DISABLE_M1";
     if (cmd == "MOVE_POS1_M1") return RampToVelocitySelectionM1(POSITIVE_SELECTION) ? "OK MOVE_POS1_M1" : "ERR MOVE_POS1_M1";
@@ -182,6 +190,14 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "HOME_M1") return HomeMotorM1() ? "OK HOME_M1" : "ERR HOME_M1";
     if (cmd == "HOME_STATUS_M1") return HomeStatusM1();
     if (cmd == "LIMITS_M1") return LimitStatusM1();
+    if (cmd == "MARK_HOMED_M1" || cmd == "SET_HOME_M1:1") {
+        motor1Homed = true;
+        return "OK MARK_HOMED_M1";
+    }
+    if (cmd == "RESET_HOME_M1" || cmd == "SET_HOME_M1:0") {
+        motor1Homed = false;
+        return "OK RESET_HOME_M1";
+    }
     if (cmd == "STATUS_M0") return MotorStatusM0();
     if (cmd == "STATUS_M1") return MotorStatusM1();
     if (cmd == "RESET_HOME") {

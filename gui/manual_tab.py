@@ -1,3 +1,5 @@
+import time
+
 from PySide6.QtCore import Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QPushButton,
@@ -62,6 +64,10 @@ class ManualTab(QWidget):
         self.auto_cycle_running = False
         self.home_sequence_active = False
         self.home_step = None
+        self.home_motor = None
+        self.home_phase_started_at = 0.0
+        self.home_release_timeout_s = 5.0
+        self.home_seek_timeout_s = 15.0
         self.home_poll_attempts = 0
         self.last_led_state = None
         self.last_gpio_inputs_response = None
@@ -494,9 +500,13 @@ class ManualTab(QWidget):
                 clearcore_input_response = self.pi_client.send("INPUTS")
                 controller_response = self.pi_client.send("CONTROLLER_STATE")
             elif mode == "local":
-                if not self.local_gpio.available:
-                    return
-                gpio_input_response = self.local_gpio.input_summary()
+                if self.local_gpio.available:
+                    gpio_input_response = self.local_gpio.input_summary()
+                else:
+                    gpio_input_response = (
+                        "GPIO_INPUTS:START=0,STOP=0,HOME=0,"
+                        "START_RAW=NA,STOP_RAW=NA,HOME_RAW=NA"
+                    )
                 if self.command_transport_ready():
                     clearcore_input_response = self.send_raw_command("INPUTS")
                     controller_response = self.send_raw_command("CONTROLLER_STATE")
@@ -630,6 +640,112 @@ class ManualTab(QWidget):
             return
         self.start_home_sequence()
 
+    def send_home_command(self, command: str):
+        response = self.route_command(command)
+        if self.response_has_error(response):
+            raise RuntimeError(response)
+        self.log_signal.emit(f"Home sequence -> {command} -> {response}")
+        return response
+
+    def read_clearcore_inputs_for_home(self):
+        response = self.route_command("INPUTS")
+        if self.response_has_error(response):
+            raise RuntimeError(response)
+        return self.parse_csv_response(response, "INPUTS:")
+
+    def home_input_active(self, inputs, motor_name: str):
+        raw_key = f"{motor_name}_HOME_RAW"
+        effective_key = f"{motor_name}_HOME"
+        return inputs.get(raw_key, inputs.get(effective_key, "0")) == "1"
+
+    def limit_input_active(self, inputs, motor_name: str):
+        raw_key = f"{motor_name}_LIMIT_RAW"
+        effective_key = f"{motor_name}_LIMIT"
+        return inputs.get(raw_key, inputs.get(effective_key, "0")) == "1"
+
+    def move_toward_home_command(self, motor_name: str):
+        return f"MOVE_POS2_{motor_name}"
+
+    def move_away_from_home_command(self, motor_name: str):
+        return f"MOVE_POS1_{motor_name}"
+
+    def start_servo_home(self, motor_name: str):
+        self.home_motor = motor_name
+        self.set_machine_state("homing")
+        self.log_signal.emit(f"Home sequence -> software homing {motor_name}")
+
+        self.send_home_command(f"SET_HOME_{motor_name}:0")
+        self.send_home_command(f"ENABLE_{motor_name}")
+
+        inputs = self.read_clearcore_inputs_for_home()
+        if inputs.get("ESTOP") == "1":
+            self.fail_home_sequence("E-stop active before servo homing")
+            return
+
+        if self.home_input_active(inputs, motor_name):
+            self.home_step = "servo_release"
+            self.home_phase_started_at = time.monotonic()
+            self.log_signal.emit(f"Home sequence -> {motor_name} releasing home switch")
+            self.send_home_command(self.move_away_from_home_command(motor_name))
+            return
+
+        self.start_servo_home_seek(motor_name)
+
+    def start_servo_home_seek(self, motor_name: str):
+        self.home_step = "servo_seek"
+        self.home_phase_started_at = time.monotonic()
+        self.log_signal.emit(f"Home sequence -> {motor_name} seeking home switch")
+        self.send_home_command(self.move_toward_home_command(motor_name))
+
+    def complete_servo_home(self, motor_name: str):
+        self.send_home_command(f"STOP_{motor_name}")
+        self.send_home_command(f"SET_HOME_{motor_name}:1")
+        self.log_signal.emit(f"Home sequence -> {motor_name} home complete")
+        if motor_name == "M0":
+            self.start_servo_home("M1")
+        else:
+            self.complete_home_sequence()
+
+    def advance_servo_home_sequence(self):
+        motor_name = self.home_motor
+        if motor_name is None:
+            self.fail_home_sequence("Servo homing state missing motor")
+            return
+
+        inputs = self.read_clearcore_inputs_for_home()
+        if inputs.get("ESTOP") == "1":
+            self.fail_home_sequence("E-stop active during servo homing")
+            return
+
+        elapsed_s = time.monotonic() - self.home_phase_started_at
+        home_active = self.home_input_active(inputs, motor_name)
+        limit_active = self.limit_input_active(inputs, motor_name)
+
+        if self.home_step == "servo_release":
+            if limit_active:
+                self.fail_home_sequence(f"{motor_name} limit active while releasing home")
+                return
+            if not home_active:
+                try:
+                    self.send_home_command(f"STOP_{motor_name}")
+                    self.start_servo_home_seek(motor_name)
+                except Exception as e:
+                    self.fail_home_sequence(f"{motor_name} release stop failed: {e}")
+                return
+            if elapsed_s > self.home_release_timeout_s:
+                self.fail_home_sequence(f"{motor_name} failed to release home switch")
+            return
+
+        if self.home_step == "servo_seek":
+            if home_active:
+                try:
+                    self.complete_servo_home(motor_name)
+                except Exception as e:
+                    self.fail_home_sequence(f"{motor_name} home completion failed: {e}")
+                return
+            if elapsed_s > self.home_seek_timeout_s:
+                self.fail_home_sequence(f"{motor_name} failed to reach home switch")
+
     def start_home_sequence(self):
         self.send_machine_best_effort("CLEAR_FAULTS")
         self.send_machine_best_effort("CLEAR_FAULT")
@@ -637,6 +753,7 @@ class ManualTab(QWidget):
         self.system_faulted = False
         self.system_homed = False
         self.home_step = "actuator_retract"
+        self.home_motor = None
         self.home_poll_attempts = 0
         self.set_machine_state("actuator_retracting")
 
@@ -668,43 +785,28 @@ class ManualTab(QWidget):
 
             self.actuator_state_label.setText(f"State: {status}")
             if status == "RETRACTED":
-                self.home_step = "servo_m0"
-                self.set_machine_state("homing")
+                try:
+                    self.start_servo_home("M0")
+                except Exception as e:
+                    self.fail_home_sequence(f"M0 software home setup failed: {e}")
                 return
             if status == "FAULT" or self.home_poll_attempts > 60:
                 self.fail_home_sequence("Actuator failed to reach retracted state")
                 return
             return
 
-        if self.home_step == "servo_m0":
+        if self.home_step in {"servo_release", "servo_seek"}:
             try:
-                response = self.route_command("HOME_M0")
+                self.advance_servo_home_sequence()
             except Exception as e:
-                self.fail_home_sequence(f"M0 home command failed: {e}")
-                return
-            if response.strip().upper().startswith("ERR"):
-                self.fail_home_sequence(f"M0 home failed: {response}")
-                return
-            self.log_signal.emit(f"Home sequence -> {response}")
-            self.home_step = "servo_m1"
+                self.fail_home_sequence(f"Servo software home failed: {e}")
             return
-
-        if self.home_step == "servo_m1":
-            try:
-                response = self.route_command("HOME_M1")
-            except Exception as e:
-                self.fail_home_sequence(f"M1 home command failed: {e}")
-                return
-            if response.strip().upper().startswith("ERR"):
-                self.fail_home_sequence(f"M1 home failed: {response}")
-                return
-            self.log_signal.emit(f"Home sequence -> {response}")
-            self.complete_home_sequence()
 
     def fail_home_sequence(self, message: str):
         self.home_timer.stop()
         self.home_sequence_active = False
         self.home_step = None
+        self.home_motor = None
         self.system_faulted = True
         self.system_homed = False
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
@@ -716,6 +818,7 @@ class ManualTab(QWidget):
         self.home_timer.stop()
         self.home_sequence_active = False
         self.home_step = None
+        self.home_motor = None
         self.system_faulted = False
         self.system_homed = True
         self.set_machine_state("ready")
@@ -1208,7 +1311,10 @@ class ManualTab(QWidget):
         mode = self.mode_combo.currentData()
         should_poll = (
             (mode == "pi" and self.pi_connected)
-            or (mode == "local" and self.local_gpio.available)
+            or (
+                mode == "local"
+                and (self.local_gpio.available or self.clearcore_connected or self.arduino_connected)
+            )
         )
 
         if should_poll and not self.supervisor_timer.isActive():
