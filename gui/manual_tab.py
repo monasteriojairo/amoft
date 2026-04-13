@@ -1,9 +1,9 @@
 import time
 
-from PySide6.QtCore import Signal, QTimer
+from PySide6.QtCore import Signal, QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QPushButton,
-    QLabel, QGridLayout, QComboBox, QCheckBox
+    QLabel, QGridLayout, QComboBox, QCheckBox, QSizePolicy
 )
 
 from controllers.arduino_controller import ArduinoController
@@ -23,6 +23,7 @@ class ManualTab(QWidget):
     m1_status_signal = Signal(str)
     hardware_start_requested = Signal()
     hardware_stop_requested = Signal()
+    command_failed_signal = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -62,6 +63,7 @@ class ManualTab(QWidget):
         self.system_faulted = False
         self.estop_active = False
         self.auto_cycle_running = False
+        self.motor_motion_direction = {"M0": "STOP", "M1": "STOP"}
         self.home_sequence_active = False
         self.home_step = None
         self.home_motor = None
@@ -235,6 +237,13 @@ class ManualTab(QWidget):
 
     def send_command(self, cmd: str):
         self.log_signal.emit(f"Command given -> {cmd}")
+        gate_reason = self.pi_software_motion_gate_reason(cmd)
+        if gate_reason is not None:
+            response = f"ERR PI_SOFTWARE_LIMIT {gate_reason}"
+            self.log_signal.emit(f"Command failed ({cmd}): {response}")
+            self.command_failed_signal.emit(cmd, response)
+            return
+
         try:
             response = self.route_command(cmd)
         except Exception as e:
@@ -254,6 +263,7 @@ class ManualTab(QWidget):
                 self.status_timer.stop()
 
             self.log_signal.emit(f"Command failed ({cmd}): {e}")
+            self.command_failed_signal.emit(cmd, str(e))
 
             if self.mode_combo.currentData() == "pi" and cmd == "PING":
                 self.set_pi_connected(False)
@@ -263,12 +273,14 @@ class ManualTab(QWidget):
 
         if self.response_has_error(response):
             self.log_signal.emit(f"Command failed ({cmd}): {response}")
+            self.command_failed_signal.emit(cmd, response)
             if self.is_actuator_command(cmd):
                 self.schedule_actuator_diagnostics(cmd)
             else:
                 self.log_clearcore_diagnostics()
             return
 
+        self.track_motor_motion_from_command(cmd)
         self.update_motor_status_from_command(cmd)
         self.update_motor_diagnostics_from_response(cmd, response)
         self.update_actuator_status_from_command(cmd, response)
@@ -343,24 +355,7 @@ class ManualTab(QWidget):
             self.set_estop_override_checked(False)
 
     def sync_limit_override_state(self):
-        if not self.command_transport_ready():
-            return
-
-        try:
-            response = self.send_raw_command("LIMIT_OVERRIDE")
-        except Exception as e:
-            self.log_signal.emit(f"Limit override state unavailable: {e}")
-            self.set_limit_override_checked(False)
-            return
-
-        normalized = (response or "").strip().upper()
-        if normalized == "LIMIT_OVERRIDE:1":
-            self.set_limit_override_checked(True)
-        elif normalized == "LIMIT_OVERRIDE:0":
-            self.set_limit_override_checked(False)
-        else:
-            self.log_signal.emit(f"Limit override state unavailable: {response}")
-            self.set_limit_override_checked(False)
+        self.set_limit_override_checked(self.limit_override_active)
 
     def on_estop_override_toggled(self, checked: bool):
         command = f"SET_ESTOP_OVERRIDE:{1 if checked else 0}"
@@ -397,38 +392,9 @@ class ManualTab(QWidget):
             self.set_estop_override_checked(previous)
 
     def on_limit_override_toggled(self, checked: bool):
-        command = f"SET_LIMIT_OVERRIDE:{1 if checked else 0}"
-        previous = self.limit_override_active
-
-        if not self.command_transport_ready():
-            self.log_signal.emit("Limit override skipped: no active ClearCore transport")
-            self.set_limit_override_checked(previous)
-            return
-
-        self.log_signal.emit(f"Command given -> {command}")
-        try:
-            response = self.route_command(command)
-            if self.response_has_error(response):
-                raise RuntimeError(response)
-
-            self.log_signal.emit(f"{command} -> {response}")
-            self.set_limit_override_checked(checked)
-
-            if checked:
-                self.log_signal.emit("Command given -> CLEAR_FAULTS")
-                clear_response = self.route_command("CLEAR_FAULTS")
-                if self.response_has_error(clear_response):
-                    self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {clear_response}")
-                else:
-                    self.log_signal.emit(f"CLEAR_FAULTS -> {clear_response}")
-
-            self.refresh_motor_statuses()
-            self.log_clearcore_diagnostics()
-        except Exception as e:
-            self.log_signal.emit(f"Command failed ({command}): {e}")
-            if checked:
-                self.log_signal.emit("Upload the updated ClearCore firmware to use limit override.")
-            self.set_limit_override_checked(previous)
+        self.set_limit_override_checked(checked)
+        state = "ON" if checked else "OFF"
+        self.log_signal.emit(f"Pi software limit/home override -> {state}")
 
     def send_pi_best_effort(self, command: str):
         return self.send_machine_best_effort(command)
@@ -438,6 +404,8 @@ class ManualTab(QWidget):
         try:
             response = self.route_command(command)
             self.log_signal.emit(f"{command} -> {response}")
+            if not self.response_has_error(response):
+                self.track_motor_motion_from_command(command)
             return response
         except Exception as e:
             self.log_signal.emit(f"Command failed ({command}): {e}")
@@ -544,13 +512,17 @@ class ManualTab(QWidget):
 
         summary = (
             f"Inputs: estop={inputs.get('ESTOP', '?')} override={inputs.get('ESTOP_OVERRIDE', '?')} "
-            f"limit_override={inputs.get('LIMIT_OVERRIDE', '?')} "
+            f"pi_limit_override={int(self.limit_override_active)} "
+            f"cc_limit_interlock={inputs.get('LIMIT_INTERLOCK', '?')} "
             f"start={gpio_inputs.get('START', '?')} "
             f"stop={gpio_inputs.get('STOP', '?')} home={gpio_inputs.get('HOME', '?')} "
-            f"m0_home={inputs.get('M0_HOME', '?')} m0_limit={inputs.get('M0_LIMIT', '?')} "
-            f"m1_home={inputs.get('M1_HOME', '?')} m1_limit={inputs.get('M1_LIMIT', '?')}"
+            f"pi_m0_home={gpio_inputs.get('M0_HOME', '?')} "
+            f"pi_m1_home={gpio_inputs.get('M1_HOME', '?')} "
+            f"cc_m0_home={inputs.get('M0_HOME', '?')} m0_limit={inputs.get('M0_LIMIT', '?')} "
+            f"cc_m1_home={inputs.get('M1_HOME', '?')} m1_limit={inputs.get('M1_LIMIT', '?')}"
         )
         self.set_machine_inputs_text(summary)
+        self.enforce_pi_software_limits(gpio_inputs)
 
     def update_actuator_supervisor_status(self):
         if not self.actuator_transport_ready():
@@ -638,12 +610,14 @@ class ManualTab(QWidget):
             self.log_signal.emit("Hardware HOME rejected: E-stop active")
             self.set_machine_state("estop_active")
             return
+        self.log_signal.emit("Hardware HOME accepted: retracting actuator and homing servos")
         self.start_home_sequence()
 
     def send_home_command(self, command: str):
         response = self.route_command(command)
         if self.response_has_error(response):
             raise RuntimeError(response)
+        self.track_motor_motion_from_command(command)
         self.log_signal.emit(f"Home sequence -> {command} -> {response}")
         return response
 
@@ -651,17 +625,87 @@ class ManualTab(QWidget):
         response = self.route_command("INPUTS")
         if self.response_has_error(response):
             raise RuntimeError(response)
-        return self.parse_csv_response(response, "INPUTS:")
+        inputs = self.parse_csv_response(response, "INPUTS:")
+        gpio_inputs = self.read_gpio_inputs_for_home()
+        for motor_name in ("M0", "M1"):
+            for input_name in ("HOME", "LIMIT"):
+                input_key = f"{motor_name}_{input_name}"
+                raw_key = f"{input_key}_RAW"
+                if input_key in gpio_inputs:
+                    inputs[input_key] = gpio_inputs[input_key]
+                    inputs[raw_key] = gpio_inputs.get(raw_key, gpio_inputs[input_key])
+                    inputs[f"{input_key}_SOURCE"] = "PI"
+        return inputs
+
+    def read_gpio_inputs_for_home(self):
+        try:
+            if self.mode_combo.currentData() == "pi":
+                if not self.pi_connected:
+                    return {}
+                response = self.pi_client.send("GPIO_INPUTS")
+            elif self.local_gpio.available:
+                response = self.local_gpio.input_summary()
+            else:
+                return {}
+        except Exception as e:
+            self.log_signal.emit(f"Home GPIO input read failed: {e}")
+            return {}
+
+        return self.parse_csv_response(response, "GPIO_INPUTS:")
 
     def home_input_active(self, inputs, motor_name: str):
         raw_key = f"{motor_name}_HOME_RAW"
         effective_key = f"{motor_name}_HOME"
+        if inputs.get(f"{motor_name}_HOME_SOURCE") == "PI":
+            return inputs.get(effective_key, "0") == "1"
         return inputs.get(raw_key, inputs.get(effective_key, "0")) == "1"
 
     def limit_input_active(self, inputs, motor_name: str):
         raw_key = f"{motor_name}_LIMIT_RAW"
         effective_key = f"{motor_name}_LIMIT"
+        if inputs.get(f"{motor_name}_LIMIT_SOURCE") != "PI":
+            return False
         return inputs.get(raw_key, inputs.get(effective_key, "0")) == "1"
+
+    def last_gpio_inputs(self):
+        return self.parse_csv_response(self.last_gpio_inputs_response, "GPIO_INPUTS:")
+
+    def pi_software_motion_gate_reason(self, cmd: str):
+        if self.limit_override_active or self.home_sequence_active:
+            return None
+
+        for motor_name in ("M0", "M1"):
+            if cmd == self.move_toward_home_command(motor_name):
+                gpio_inputs = self.last_gpio_inputs()
+                if gpio_inputs.get(f"{motor_name}_HOME") == "1":
+                    return f"{motor_name}_HOME active"
+        return None
+
+    def track_motor_motion_from_command(self, cmd: str):
+        for motor_name in ("M0", "M1"):
+            if cmd == self.move_toward_home_command(motor_name):
+                self.motor_motion_direction[motor_name] = "HOME"
+            elif cmd == self.move_away_from_home_command(motor_name):
+                self.motor_motion_direction[motor_name] = "AWAY"
+            elif cmd in {f"STOP_{motor_name}", f"DISABLE_{motor_name}"}:
+                self.motor_motion_direction[motor_name] = "STOP"
+
+    def enforce_pi_software_limits(self, gpio_inputs):
+        if self.limit_override_active or self.home_sequence_active:
+            return
+        if not self.command_transport_ready():
+            return
+
+        for motor_name in ("M0", "M1"):
+            if (
+                self.motor_motion_direction.get(motor_name) == "HOME"
+                and gpio_inputs.get(f"{motor_name}_HOME") == "1"
+            ):
+                self.motor_motion_direction[motor_name] = "STOP"
+                self.log_signal.emit(
+                    f"Pi software limit -> {motor_name}_HOME active; stopping {motor_name}"
+                )
+                self.send_machine_best_effort(f"STOP_{motor_name}")
 
     def move_toward_home_command(self, motor_name: str):
         return f"MOVE_POS2_{motor_name}"
@@ -685,7 +729,10 @@ class ManualTab(QWidget):
         if self.home_input_active(inputs, motor_name):
             self.home_step = "servo_release"
             self.home_phase_started_at = time.monotonic()
-            self.log_signal.emit(f"Home sequence -> {motor_name} releasing home switch")
+            source = inputs.get(f"{motor_name}_HOME_SOURCE", "ClearCore")
+            self.log_signal.emit(
+                f"Home sequence -> {motor_name} releasing home switch ({source})"
+            )
             self.send_home_command(self.move_away_from_home_command(motor_name))
             return
 
@@ -694,7 +741,9 @@ class ManualTab(QWidget):
     def start_servo_home_seek(self, motor_name: str):
         self.home_step = "servo_seek"
         self.home_phase_started_at = time.monotonic()
-        self.log_signal.emit(f"Home sequence -> {motor_name} seeking home switch")
+        inputs = self.read_clearcore_inputs_for_home()
+        source = inputs.get(f"{motor_name}_HOME_SOURCE", "ClearCore")
+        self.log_signal.emit(f"Home sequence -> {motor_name} seeking home switch ({source})")
         self.send_home_command(self.move_toward_home_command(motor_name))
 
     def complete_servo_home(self, motor_name: str):
@@ -719,7 +768,10 @@ class ManualTab(QWidget):
 
         elapsed_s = time.monotonic() - self.home_phase_started_at
         home_active = self.home_input_active(inputs, motor_name)
-        limit_active = self.limit_input_active(inputs, motor_name)
+        limit_active = (
+            not self.limit_override_active
+            and self.limit_input_active(inputs, motor_name)
+        )
 
         if self.home_step == "servo_release":
             if limit_active:
@@ -756,18 +808,18 @@ class ManualTab(QWidget):
         self.home_motor = None
         self.home_poll_attempts = 0
         self.set_machine_state("actuator_retracting")
+        self.log_signal.emit("Home sequence -> retracting actuator before servo homing")
 
         try:
-            response = self.route_command("HOME_ACTUATOR")
+            response = self.send_home_command("RETRACT_TO_HOME")
         except Exception as e:
-            self.fail_home_sequence(f"Actuator home command failed: {e}")
+            self.fail_home_sequence(f"Actuator retract command failed: {e}")
             return
 
         if response.strip().upper().startswith("ERR"):
-            self.fail_home_sequence(f"Actuator home rejected: {response}")
+            self.fail_home_sequence(f"Actuator retract rejected: {response}")
             return
 
-        self.log_signal.emit(f"Home sequence -> {response}")
         self.home_timer.start()
 
     def advance_home_sequence(self):
@@ -1052,9 +1104,9 @@ class ManualTab(QWidget):
         elif cmd in {"STOP_ACTUATOR", "STOP"} and normalized == "STOPPED":
             self.actuator_state_label.setText("State: STOPPED")
         elif cmd == "LIMITS" and normalized.startswith("LIMITS:") and self.actuator_limits_label is not None:
-            self.actuator_limits_label.setText(response)
+            self.set_actuator_detail_text(response)
         elif cmd in {"DIAG", "DIAGNOSTICS"} and normalized.startswith("DIAG:") and self.actuator_limits_label is not None:
-            self.actuator_limits_label.setText(response)
+            self.set_actuator_detail_text(response)
 
     def refresh_motor_statuses(self):
         if not self.command_transport_ready():
@@ -1122,12 +1174,12 @@ class ManualTab(QWidget):
         if not self.command_transport_ready():
             return
 
+        diagnostic_responses = {}
         for command in (
             "INPUTS",
             "CONTROLLER_STATE",
             "FAULTS",
             "ESTOP_OVERRIDE",
-            "LIMIT_OVERRIDE",
             "LIMITS_M0",
             "LIMITS_M1",
             "STATUS_M0",
@@ -1135,9 +1187,23 @@ class ManualTab(QWidget):
         ):
             try:
                 response = self.send_raw_command(command)
+                diagnostic_responses[command] = response
                 self.log_signal.emit(f"ClearCore diagnostic {command} -> {response}")
             except Exception as e:
                 self.log_signal.emit(f"ClearCore diagnostic {command} failed: {e}")
+
+        inputs = self.parse_csv_response(diagnostic_responses.get("INPUTS"), "INPUTS:")
+        if inputs.get("LIMIT_INTERLOCK") == "1":
+            active_inputs = [
+                name
+                for name in ("M0_HOME", "M0_LIMIT", "M1_HOME", "M1_LIMIT")
+                if inputs.get(name) == "1"
+            ]
+            if active_inputs:
+                self.log_signal.emit(
+                    "ClearCore motion gate -> active inputs while firmware interlock is enabled: "
+                    f"{','.join(active_inputs)}"
+                )
 
     def send_raw_command(self, cmd: str):
         if self.mode_combo.currentData() == "local":
@@ -1457,6 +1523,19 @@ class ManualTab(QWidget):
         if self.arduino_diag_label is not None:
             self.arduino_diag_label.setText(text)
 
+    def configure_fixed_detail_label(self, label: QLabel, lines: int = 3):
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        label.setFixedHeight(label.fontMetrics().lineSpacing() * lines + 8)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+    def set_actuator_detail_text(self, text: str):
+        if self.actuator_limits_label is None:
+            return
+        self.actuator_limits_label.setToolTip(text)
+        self.actuator_limits_label.setText(text)
+
     def set_clearcore_port(self):
         port = self.port_combo.currentData()
         if port:
@@ -1500,9 +1579,9 @@ class ManualTab(QWidget):
         self.estop_override_checkbox.setToolTip(
             "Temporary integration mode: ignore the ClearCore E-stop input."
         )
-        self.limit_override_checkbox = QCheckBox("Limit/home override")
+        self.limit_override_checkbox = QCheckBox("Pi limit/home override")
         self.limit_override_checkbox.setToolTip(
-            "Temporary integration mode: ignore ClearCore home and limit inputs."
+            "Temporary integration mode: ignore Pi software limit checks. ClearCore home/limit inputs are report-only."
         )
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh Ports")
@@ -1667,6 +1746,8 @@ class ManualTab(QWidget):
 
         self.actuator_state_label = QLabel("State: IDLE")
         self.actuator_limits_label = QLabel("Limits: Unknown")
+        self.configure_fixed_detail_label(self.actuator_limits_label)
+        self.actuator_limits_label.setToolTip("Limits: Unknown")
 
         self.actuator_widgets = [extend_btn, retract_btn, stop_btn, status_btn, limits_btn, diag_btn]
 

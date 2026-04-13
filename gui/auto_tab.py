@@ -37,6 +37,7 @@ class AutoTab(QWidget):
         self.is_paused = False
         self.pending_delay_ms = 0
         self.delay_started_at = 0.0
+        self.executing_command = None
         self.delay_timer = QTimer(self)
         self.delay_timer.setSingleShot(True)
         self.delay_timer.timeout.connect(self.advance_sequence)
@@ -512,7 +513,11 @@ class AutoTab(QWidget):
         self.step_label.setText(f"Current Step: {step['label']}")
         progress = int(((self.current_step_index + 1) / len(self.execution_steps)) * 100)
         self.progress.setValue(progress)
+        self.executing_command = step["command"]
         self.command_signal.emit(step["command"])
+        if not self.is_running:
+            return
+        self.executing_command = None
         self.log_signal.emit(f"Auto: Command sent -> {step['command']}")
 
         if step["delay_ms"] > 0:
@@ -521,6 +526,37 @@ class AutoTab(QWidget):
             self.delay_timer.start(step["delay_ms"])
         else:
             QTimer.singleShot(0, self.advance_sequence)
+
+    def handle_command_failure(self, command: str, detail: str):
+        if not self.is_running:
+            return
+        if self.current_step_index < 0 or self.current_step_index >= len(self.execution_steps):
+            return
+
+        active_step = self.execution_steps[self.current_step_index]
+        if command != active_step["command"]:
+            return
+
+        self.delay_timer.stop()
+        self.executing_command = None
+        self.is_running = False
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.step_label.setText("Current Step: ABORTED")
+        self.progress.setValue(0)
+        self.log_signal.emit(f"Auto: Aborted after command failed -> {command}: {detail}")
+        self.cycle_state_signal.emit("stopped")
+
+        for cleanup_command in (
+            "STOP_M0",
+            "DISABLE_M0",
+            "STOP_M1",
+            "DISABLE_M1",
+            "STOP_ACTUATOR",
+        ):
+            self.command_signal.emit(cleanup_command)
+
+        self.update_button_states()
 
     def pause_cycle(self):
         if not self.is_running or self.is_paused:
@@ -556,6 +592,7 @@ class AutoTab(QWidget):
             return
 
         self.delay_timer.stop()
+        self.executing_command = None
         self.command_signal.emit("STOP_M0")
         self.command_signal.emit("DISABLE_M0")
         self.command_signal.emit("STOP_M1")
@@ -583,6 +620,7 @@ class AutoTab(QWidget):
 
     def reset_cycle(self):
         self.delay_timer.stop()
+        self.executing_command = None
         self.is_running = False
         self.is_paused = False
         self.pending_delay_ms = 0
@@ -594,6 +632,7 @@ class AutoTab(QWidget):
         self.update_button_states()
 
     def finish_cycle(self, message):
+        self.executing_command = None
         self.is_running = False
         self.is_paused = False
         self.pending_delay_ms = 0

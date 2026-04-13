@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         self.manual_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.auto_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.auto_tab.command_signal.connect(self.manual_tab.send_command)
+        self.manual_tab.command_failed_signal.connect(self.auto_tab.handle_command_failure)
         self.auto_tab.reconnect_signal.connect(self.reconnect_from_auto)
         self.auto_tab.cycle_state_signal.connect(self.manual_tab.on_cycle_state_changed)
         self.settings_tab.log_signal.connect(self.diagnostics_tab.append_log)

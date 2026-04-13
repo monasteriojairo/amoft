@@ -20,6 +20,11 @@ class PiGpioManager:
             "STOP": gpio_config.get("stop_button_pin", 27),
             "HOME": gpio_config.get("home_button_pin", 22),
         }
+        self.home_switch_pins = {
+            "M0_HOME": gpio_config.get("m0_home_pin", 23),
+            "M1_HOME": gpio_config.get("m1_home_pin", 24),
+        }
+        self.input_pins = {**self.button_pins, **self.home_switch_pins}
         self.led_pins = {
             "READY": gpio_config.get("ready_led_pin", 5),
             "RUNNING": gpio_config.get("running_led_pin", 6),
@@ -27,6 +32,14 @@ class PiGpioManager:
         }
         self.gpiod_chip = gpio_config.get("gpiod_chip")
         self.button_active_high = bool(gpio_config.get("buttons_active_high", True))
+        self.button_pull_up = bool(gpio_config.get("buttons_pull_up", not self.button_active_high))
+        self.home_switches_normally_closed = bool(
+            gpio_config.get("home_switches_normally_closed", True)
+        )
+        self.home_switches_active_high = bool(
+            gpio_config.get("home_switches_active_high", self.home_switches_normally_closed)
+        )
+        self.home_switch_pull_up = bool(gpio_config.get("home_switch_pull_up", True))
         self.led_active_high = bool(gpio_config.get("leds_active_high", True))
         self.available = self.enabled and GPIO is not None
         self.backend = "RPi.GPIO" if self.available else None
@@ -34,21 +47,36 @@ class PiGpioManager:
         self._lock = threading.Lock()
         self._pending_event = "NONE"
         self._button_states = {name: False for name in self.button_pins}
+        self._home_switch_states = {name: False for name in self.home_switch_pins}
         self._led_states = {name: False for name in self.led_pins}
 
         if self.available:
             try:
                 GPIO.setwarnings(False)
                 GPIO.setmode(GPIO.BCM)
-                pull_mode = GPIO.PUD_DOWN if self.button_active_high else GPIO.PUD_UP
+
+                button_pull_mode = GPIO.PUD_UP if self.button_pull_up else GPIO.PUD_DOWN
+                home_pull_mode = GPIO.PUD_UP if self.home_switch_pull_up else GPIO.PUD_DOWN
 
                 for pin in self.button_pins.values():
-                    GPIO.setup(pin, GPIO.IN, pull_up_down=pull_mode)
+                    GPIO.setup(pin, GPIO.IN, pull_up_down=button_pull_mode)
+
+                for pin in self.home_switch_pins.values():
+                    if pin not in self.button_pins.values():
+                        GPIO.setup(pin, GPIO.IN, pull_up_down=home_pull_mode)
 
                 for pin in self.led_pins.values():
                     GPIO.setup(pin, GPIO.OUT, initial=self._encode_output(False))
 
-                self._button_states = self._read_buttons()
+                initial_states = self._read_inputs()
+                self._button_states = {
+                    name: initial_states[name]
+                    for name in self.button_pins
+                }
+                self._home_switch_states = {
+                    name: initial_states[name]
+                    for name in self.home_switch_pins
+                }
             except Exception as exc:
                 self.available = False
                 self.backend = None
@@ -59,7 +87,15 @@ class PiGpioManager:
             self.available = True
             self.backend_error = ""
             try:
-                self._button_states = self._read_buttons()
+                initial_states = self._read_inputs()
+                self._button_states = {
+                    name: initial_states[name]
+                    for name in self.button_pins
+                }
+                self._home_switch_states = {
+                    name: initial_states[name]
+                    for name in self.home_switch_pins
+                }
             except Exception as exc:
                 self.available = False
                 self.backend = None
@@ -73,30 +109,43 @@ class PiGpioManager:
     def _decode_input(self, raw_value: int) -> bool:
         return bool(raw_value) if self.button_active_high else not bool(raw_value)
 
+    def _decode_named_input(self, name: str, raw_value: int) -> bool:
+        if name in self.home_switch_pins:
+            return bool(raw_value) if self.home_switches_active_high else not bool(raw_value)
+        return self._decode_input(raw_value)
+
     def _read_buttons(self):
         if not self.available:
             return dict(self._button_states)
-        raw_states = self._read_button_raws()
+        raw_states = self._read_input_raws()
         return {
-            name: self._decode_input(raw_states[name])
+            name: self._decode_named_input(name, raw_states[name])
             for name in self.button_pins
         }
 
-    def _read_button_raws(self):
+    def _read_inputs(self):
         if not self.available:
-            return {name: "NA" for name in self.button_pins}
-        if self.backend == "gpioget":
-            return self._read_button_raws_gpioget()
+            return {**self._button_states, **self._home_switch_states}
+        raw_states = self._read_input_raws()
         return {
-            name: GPIO.input(pin)
-            for name, pin in self.button_pins.items()
+            name: self._decode_named_input(name, raw_states[name])
+            for name in self.input_pins
         }
 
-    def _read_button_raws_gpioget(self):
-        bias = "pull-down" if self.button_active_high else "pull-up"
-        pin_numbers = [str(pin) for pin in self.button_pins.values()]
-        line_names = [f"GPIO{pin}" for pin in self.button_pins.values()]
+    def _read_input_raws(self):
+        if not self.available:
+            return {name: "NA" for name in self.input_pins}
+        if self.backend == "gpioget":
+            return self._read_input_raws_gpioget()
+        return {
+            name: GPIO.input(pin)
+            for name, pin in self.input_pins.items()
+        }
 
+    def _gpioget_raws_for_pins(self, pins, pull_up: bool):
+        bias = "pull-up" if pull_up else "pull-down"
+        pin_numbers = [str(pin) for pin in pins.values()]
+        line_names = [f"GPIO{pin}" for pin in pins.values()]
         attempts = []
         if self.gpiod_chip:
             attempts.append(["gpioget", "--numeric", "-c", str(self.gpiod_chip), "-b", bias] + pin_numbers)
@@ -128,8 +177,17 @@ class PiGpioManager:
             raise RuntimeError(f"gpioget returned {result.stdout.strip()!r}")
         return {
             name: int(value)
-            for name, value in zip(self.button_pins.keys(), values)
+            for name, value in zip(pins.keys(), values)
         }
+
+    def _read_input_raws_gpioget(self):
+        raw_states = {}
+        raw_states.update(self._gpioget_raws_for_pins(self.button_pins, self.button_pull_up))
+        raw_states.update(self._gpioget_raws_for_pins(
+            self.home_switch_pins,
+            self.home_switch_pull_up,
+        ))
+        return raw_states
 
     def _latch_event(self, event_name: str):
         if self._pending_event == "NONE":
@@ -148,15 +206,18 @@ class PiGpioManager:
     def poll(self):
         with self._lock:
             try:
-                current_states = self._read_buttons()
+                current_states = self._read_inputs()
             except Exception as exc:
                 self.backend_error = str(exc)
                 return
-            for name, current in current_states.items():
+            for name in self.button_pins:
+                current = current_states[name]
                 previous = self._button_states.get(name, False)
                 if current and not previous:
                     self._latch_event(name)
                 self._button_states[name] = current
+            for name in self.home_switch_pins:
+                self._home_switch_states[name] = current_states[name]
 
     def get_event(self) -> str:
         self.poll()
@@ -169,17 +230,21 @@ class PiGpioManager:
         self.poll()
         with self._lock:
             try:
-                raw_states = self._read_button_raws()
+                raw_states = self._read_input_raws()
             except Exception as exc:
                 self.backend_error = str(exc)
-                raw_states = {name: "NA" for name in self.button_pins}
+                raw_states = {name: "NA" for name in self.input_pins}
             return (
                 f"GPIO_INPUTS:START={int(self._button_states['START'])},"
                 f"STOP={int(self._button_states['STOP'])},"
                 f"HOME={int(self._button_states['HOME'])},"
+                f"M0_HOME={int(self._home_switch_states['M0_HOME'])},"
+                f"M1_HOME={int(self._home_switch_states['M1_HOME'])},"
                 f"START_RAW={raw_states['START']},"
                 f"STOP_RAW={raw_states['STOP']},"
-                f"HOME_RAW={raw_states['HOME']}"
+                f"HOME_RAW={raw_states['HOME']},"
+                f"M0_HOME_RAW={raw_states['M0_HOME']},"
+                f"M1_HOME_RAW={raw_states['M1_HOME']}"
             )
 
     def config_summary(self) -> str:
@@ -191,9 +256,15 @@ class PiGpioManager:
             f"BACKEND={backend},"
             f"GPIOD_CHIP={self.gpiod_chip or 'auto'},"
             f"BUTTON_ACTIVE_HIGH={int(self.button_active_high)},"
+            f"BUTTON_PULL_UP={int(self.button_pull_up)},"
+            f"HOME_SWITCH_NC={int(self.home_switches_normally_closed)},"
+            f"HOME_SWITCH_ACTIVE_HIGH={int(self.home_switches_active_high)},"
+            f"HOME_SWITCH_PULL_UP={int(self.home_switch_pull_up)},"
             f"START_PIN={self.button_pins['START']},"
             f"STOP_PIN={self.button_pins['STOP']},"
             f"HOME_PIN={self.button_pins['HOME']},"
+            f"M0_HOME_PIN={self.home_switch_pins['M0_HOME']},"
+            f"M1_HOME_PIN={self.home_switch_pins['M1_HOME']},"
             f"ERROR={error}"
         )
 

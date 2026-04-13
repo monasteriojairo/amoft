@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v7"
+#define firmwareVersion "clearcore-dual-motor-v8"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -31,6 +31,7 @@ static const bool M0_HOME_ACTIVE_LOW = true;
 static const bool M0_LIMIT_ACTIVE_LOW = true;
 static const bool M1_HOME_ACTIVE_LOW = true;
 static const bool M1_LIMIT_ACTIVE_LOW = true;
+static const bool LIMIT_INTERLOCK_ENABLED = false;
 
 bool RampToVelocitySelectionM0(int velocityIndex);
 bool RampToVelocitySelectionM1(int velocityIndex);
@@ -136,7 +137,7 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "PING_M0") return "PONG_M0";
     if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
-    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,ESTOP_OVERRIDE,LIMIT_OVERRIDE";
+    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,LIMITS_REPORT_ONLY,PI_LIMIT_OWNER,ESTOP_OVERRIDE";
     if (cmd == "INPUTS") return InputSummary();
     if (cmd == "CONTROLLER_STATE") return ControllerStateSummary();
     if (cmd == "FAULTS") return FaultSummary();
@@ -261,10 +262,10 @@ bool RawM0HomeActive() { return SignalActive(m0HomeSwitch.State(), M0_HOME_ACTIV
 bool RawM0LimitActive() { return SignalActive(m0LimitSwitch.State(), M0_LIMIT_ACTIVE_LOW); }
 bool RawM1HomeActive() { return SignalActive(m1HomeSwitch.State(), M1_HOME_ACTIVE_LOW); }
 bool RawM1LimitActive() { return SignalActive(m1LimitSwitch.State(), M1_LIMIT_ACTIVE_LOW); }
-bool M0HomeActive() { return !limitOverrideEnabled && RawM0HomeActive(); }
-bool M0LimitActive() { return !limitOverrideEnabled && RawM0LimitActive(); }
-bool M1HomeActive() { return !limitOverrideEnabled && RawM1HomeActive(); }
-bool M1LimitActive() { return !limitOverrideEnabled && RawM1LimitActive(); }
+bool M0HomeActive() { return RawM0HomeActive(); }
+bool M0LimitActive() { return RawM0LimitActive(); }
+bool M1HomeActive() { return RawM1HomeActive(); }
+bool M1LimitActive() { return RawM1LimitActive(); }
 
 bool Motor0MovingTowardHome() { return motor0VelocitySelection == M0_HOME_SELECTION; }
 bool Motor0MovingTowardLimit() { return motor0VelocitySelection == M0_LIMIT_SELECTION; }
@@ -282,7 +283,7 @@ void MonitorSafetyInputs() {
         return;
     }
 
-    if (motor0Enabled && motor0VelocitySelection != STOP_SELECTION) {
+    if (LIMIT_INTERLOCK_ENABLED && motor0Enabled && motor0VelocitySelection != STOP_SELECTION) {
         if (Motor0MovingTowardLimit() && M0LimitActive()) {
             controllerFaultLatched = true;
             controllerFaultFromEstop = false;
@@ -292,7 +293,7 @@ void MonitorSafetyInputs() {
         }
     }
 
-    if (motor1Enabled && motor1VelocitySelection != STOP_SELECTION) {
+    if (LIMIT_INTERLOCK_ENABLED && motor1Enabled && motor1VelocitySelection != STOP_SELECTION) {
         if (Motor1MovingTowardLimit() && M1LimitActive()) {
             controllerFaultLatched = true;
             controllerFaultFromEstop = false;
@@ -356,16 +357,20 @@ bool StopMotorM1() {
 bool CheckMotionAllowedM0(int velocityIndex) {
     if (velocityIndex == STOP_SELECTION) return true;
     if (EstopActive() || controllerFaultLatched) return false;
-    if (velocityIndex == M0_HOME_SELECTION && M0HomeActive()) return false;
-    if (velocityIndex == M0_LIMIT_SELECTION && M0LimitActive()) return false;
+    if (LIMIT_INTERLOCK_ENABLED && !limitOverrideEnabled &&
+        velocityIndex == M0_HOME_SELECTION && M0HomeActive()) return false;
+    if (LIMIT_INTERLOCK_ENABLED && !limitOverrideEnabled &&
+        velocityIndex == M0_LIMIT_SELECTION && M0LimitActive()) return false;
     return true;
 }
 
 bool CheckMotionAllowedM1(int velocityIndex) {
     if (velocityIndex == STOP_SELECTION) return true;
     if (EstopActive() || controllerFaultLatched) return false;
-    if (velocityIndex == M1_HOME_SELECTION && M1HomeActive()) return false;
-    if (velocityIndex == M1_LIMIT_SELECTION && M1LimitActive()) return false;
+    if (LIMIT_INTERLOCK_ENABLED && !limitOverrideEnabled &&
+        velocityIndex == M1_HOME_SELECTION && M1HomeActive()) return false;
+    if (LIMIT_INTERLOCK_ENABLED && !limitOverrideEnabled &&
+        velocityIndex == M1_LIMIT_SELECTION && M1LimitActive()) return false;
     return true;
 }
 
@@ -526,6 +531,7 @@ String LimitStatusM0() {
            ",HOME_RAW=" + (RawM0HomeActive() ? "1" : "0") +
            ",LIMIT=" + (M0LimitActive() ? "1" : "0") +
            ",LIMIT_RAW=" + (RawM0LimitActive() ? "1" : "0") +
+           ",INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
            ",OVERRIDE=" + (limitOverrideEnabled ? "1" : "0");
 }
 
@@ -534,6 +540,7 @@ String LimitStatusM1() {
            ",HOME_RAW=" + (RawM1HomeActive() ? "1" : "0") +
            ",LIMIT=" + (M1LimitActive() ? "1" : "0") +
            ",LIMIT_RAW=" + (RawM1LimitActive() ? "1" : "0") +
+           ",INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
            ",OVERRIDE=" + (limitOverrideEnabled ? "1" : "0");
 }
 
@@ -541,6 +548,8 @@ String InputSummary() {
     return String("INPUTS:ESTOP=") + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
+           ",LIMIT_OWNER=PI" +
+           ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
            ",LIMIT_OVERRIDE=" + (limitOverrideEnabled ? "1" : "0") +
            ",M0_HOME=" + (M0HomeActive() ? "1" : "0") +
            ",M0_HOME_RAW=" + (RawM0HomeActive() ? "1" : "0") +
@@ -557,6 +566,8 @@ String ControllerStateSummary() {
            ",ESTOP=" + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
+           ",LIMIT_OWNER=PI" +
+           ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
            ",LIMIT_OVERRIDE=" + (limitOverrideEnabled ? "1" : "0") +
            ",M0_HOMED=" + (motor0Homed ? "1" : "0") +
            ",M1_HOMED=" + (motor1Homed ? "1" : "0");
@@ -566,6 +577,8 @@ String FaultSummary() {
     return String("FAULTS:ESTOP=") + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
+           ",LIMIT_OWNER=PI" +
+           ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
            ",LIMIT_OVERRIDE=" + (limitOverrideEnabled ? "1" : "0") +
            ",LATCH=" + (controllerFaultLatched ? "1" : "0") +
            ",LATCH_ESTOP=" + (controllerFaultFromEstop ? "1" : "0") +
@@ -578,5 +591,7 @@ String EstopOverrideSummary() {
 }
 
 String LimitOverrideSummary() {
-    return String("LIMIT_OVERRIDE:") + (limitOverrideEnabled ? "1" : "0");
+    return String("LIMIT_OVERRIDE:") + (limitOverrideEnabled ? "1" : "0") +
+           ",INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
+           ",OWNER=PI";
 }
