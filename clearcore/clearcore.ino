@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v11"
+#define firmwareVersion "clearcore-dual-motor-v12"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -26,7 +26,7 @@ static const uint32_t HOMING_SEEK_TIMEOUT_MS = 15000;
 static const uint32_t HOMING_RELEASE_TIMEOUT_MS = 5000;
 static const uint32_t HLFB_TIMEOUT_MS = 5000;
 
-static const bool ESTOP_ACTIVE_LOW = true;
+static const bool ESTOP_OK_ACTIVE_HIGH = true;
 static const bool M0_HOME_ACTIVE_LOW = true;
 static const bool M0_LIMIT_ACTIVE_LOW = true;
 static const bool M1_HOME_ACTIVE_LOW = true;
@@ -69,6 +69,7 @@ bool MoveUntilHomeStateM1(bool targetState, int velocityIndex, uint32_t timeoutM
 void ConfigureInputs();
 void MonitorSafetyInputs();
 bool SignalActive(int16_t rawState, bool activeLow);
+bool RawEstopOk();
 bool RawEstopActive();
 bool EstopActive();
 bool RawM0HomeActive();
@@ -138,7 +139,7 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "PING_M0") return "PONG_M0";
     if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
-    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,LIMITS_REPORT_ONLY,PI_LIMIT_OWNER,ESTOP_OVERRIDE,PIN_STATES";
+    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,ESTOP_OK_HIGH,SOFTWARE_HOME,LIMITS_REPORT_ONLY,PI_LIMIT_OWNER,ESTOP_OVERRIDE,PIN_STATES";
     if (cmd == "INPUTS") return InputSummary();
     if (cmd == "PIN_STATES" || cmd == "PINS") return PinStateSummary();
     if (cmd == "CONTROLLER_STATE") return ControllerStateSummary();
@@ -258,7 +259,11 @@ bool SignalActive(int16_t rawState, bool activeLow) {
     return activeLow ? rawState == 0 : rawState != 0;
 }
 
-bool RawEstopActive() { return SignalActive(estopStatus.State(), ESTOP_ACTIVE_LOW); }
+bool RawEstopOk() {
+    int16_t state = estopStatus.State();
+    return ESTOP_OK_ACTIVE_HIGH ? state != 0 : state == 0;
+}
+bool RawEstopActive() { return !RawEstopOk(); }
 bool EstopActive() { return !estopOverrideEnabled && RawEstopActive(); }
 bool RawM0HomeActive() { return SignalActive(m0HomeSwitch.State(), M0_HOME_ACTIVE_LOW); }
 bool RawM0LimitActive() { return SignalActive(m0LimitSwitch.State(), M0_LIMIT_ACTIVE_LOW); }
@@ -560,6 +565,8 @@ String LimitStatusM1() {
 String InputSummary() {
     return String("INPUTS:ESTOP=") + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OK=" + (RawEstopOk() ? "1" : "0") +
+           ",ESTOP_OK_ACTIVE_HIGH=" + (ESTOP_OK_ACTIVE_HIGH ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
            ",LIMIT_OWNER=PI" +
            ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
@@ -577,7 +584,8 @@ String InputSummary() {
 String PinStateSummary() {
     return String("PINS:ESTOP_STATE=") + String((int)estopStatus.State()) +
            ",ESTOP_ACTIVE=" + (RawEstopActive() ? "1" : "0") +
-           ",ESTOP_ACTIVE_LOW=" + (ESTOP_ACTIVE_LOW ? "1" : "0") +
+           ",ESTOP_OK=" + (RawEstopOk() ? "1" : "0") +
+           ",ESTOP_OK_ACTIVE_HIGH=" + (ESTOP_OK_ACTIVE_HIGH ? "1" : "0") +
            ",M0_HOME_STATE=" + String((int)m0HomeSwitch.State()) +
            ",M0_HOME_ACTIVE=" + (RawM0HomeActive() ? "1" : "0") +
            ",M0_LIMIT_STATE=" + String((int)m0LimitSwitch.State()) +
@@ -592,6 +600,7 @@ String ControllerStateSummary() {
     return String("CONTROLLER_STATE:FAULT=") + (controllerFaultLatched ? "1" : "0") +
            ",ESTOP=" + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OK=" + (RawEstopOk() ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
            ",LIMIT_OWNER=PI" +
            ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +
@@ -603,6 +612,7 @@ String ControllerStateSummary() {
 String FaultSummary() {
     return String("FAULTS:ESTOP=") + (EstopActive() ? "1" : "0") +
            ",ESTOP_RAW=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_OK=" + (RawEstopOk() ? "1" : "0") +
            ",ESTOP_OVERRIDE=" + (estopOverrideEnabled ? "1" : "0") +
            ",LIMIT_OWNER=PI" +
            ",LIMIT_INTERLOCK=" + (LIMIT_INTERLOCK_ENABLED ? "1" : "0") +

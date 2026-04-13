@@ -64,13 +64,17 @@ class ManualTab(QWidget):
         self.system_homed = False
         self.system_faulted = False
         self.estop_active = False
+        self.estop_raw_active = None
+        self.safety_stop_latched = False
         self.auto_cycle_running = False
         self.motor_motion_direction = {"M0": "STOP", "M1": "STOP"}
+        self.actuator_motion_active = False
         self.home_sequence_active = False
         self.home_step = None
         self.home_motor = None
         self.home_phase_started_at = 0.0
         self.home_release_timeout_s = 5.0
+        self.home_backoff_timeout_s = 5.0
         self.home_seek_timeout_s = 15.0
         self.home_actuator_started_at = 0.0
         self.home_actuator_seen_retracting = False
@@ -88,7 +92,12 @@ class ManualTab(QWidget):
             "M1_HOME": {"state": None, "raw": None},
         }
         self.last_home_switch_change = None
-        self.last_estop_snapshot = {"state": None, "raw": None, "override": None}
+        self.last_estop_snapshot = {
+            "state": None,
+            "raw": None,
+            "ok": None,
+            "override": None,
+        }
 
         layout = QHBoxLayout(self)
 
@@ -251,6 +260,10 @@ class ManualTab(QWidget):
         self.set_arduino_connected(False)
         self.set_motor_status("M0", "off")
         self.set_motor_status("M1", "off")
+        self.motor_motion_direction = {"M0": "STOP", "M1": "STOP"}
+        self.actuator_motion_active = False
+        self.estop_raw_active = None
+        self.safety_stop_latched = False
         self.status_timer.stop()
         self.update_supervisor_timer()
         self.home_timer.stop()
@@ -310,6 +323,8 @@ class ManualTab(QWidget):
             return
 
         self.track_motor_motion_from_command(cmd)
+        if cmd in {"CLEAR_FAULTS", "CLEAR_FAULT"}:
+            self.safety_stop_latched = False
         self.update_motor_status_from_command(cmd)
         self.update_motor_diagnostics_from_response(cmd, response)
         self.update_actuator_status_from_command(cmd, response)
@@ -399,29 +414,34 @@ class ManualTab(QWidget):
     def log_estop_transitions(self, inputs):
         state = inputs.get("ESTOP")
         raw = inputs.get("ESTOP_RAW")
+        ok = inputs.get("ESTOP_OK")
         override = inputs.get("ESTOP_OVERRIDE")
-        if state is None and raw is None and override is None:
+        if state is None and raw is None and ok is None and override is None:
             return
 
         previous = self.last_estop_snapshot
         had_previous = (
             previous["state"] is not None
             or previous["raw"] is not None
+            or previous["ok"] is not None
             or previous["override"] is not None
         )
         if (
             previous["state"] == state
             and previous["raw"] == raw
+            and previous["ok"] == ok
             and previous["override"] == override
         ):
             return
 
         previous["state"] = state
         previous["raw"] = raw
+        previous["ok"] = ok
         previous["override"] = override
         status = "ACTIVE" if state == "1" else "INACTIVE"
         self.log_signal.emit(
             f"ClearCore E-stop input -> {status} raw={raw if raw is not None else '?'} "
+            f"ok={ok if ok is not None else '?'} "
             f"override={override if override is not None else '?'}"
         )
         if state == "1":
@@ -478,7 +498,7 @@ class ManualTab(QWidget):
             dialog.setFixedSize(340, 150)
 
             layout = QVBoxLayout(dialog)
-            self.homing_dialog_label = QLabel("HOMING,,,,,")
+            self.homing_dialog_label = QLabel("HOMING.....")
             self.homing_dialog_label.setAlignment(Qt.AlignCenter)
             self.homing_dialog_label.setStyleSheet("font-size: 24px; font-weight: bold;")
 
@@ -512,8 +532,8 @@ class ManualTab(QWidget):
     def update_homing_dialog(self):
         if self.homing_dialog_label is None:
             return
-        comma_count = 1 + (self.homing_dialog_phase % 5)
-        self.homing_dialog_label.setText("HOMING" + ("," * comma_count))
+        period_count = 1 + (self.homing_dialog_phase % 5)
+        self.homing_dialog_label.setText("HOMING" + ("." * period_count))
         self.homing_dialog_phase += 1
 
     def hide_homing_dialog(self):
@@ -587,6 +607,7 @@ class ManualTab(QWidget):
                 if self.response_has_error(clear_response):
                     self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {clear_response}")
                 else:
+                    self.safety_stop_latched = False
                     self.log_signal.emit(f"CLEAR_FAULTS -> {clear_response}")
 
             self.refresh_motor_statuses()
@@ -636,6 +657,7 @@ class ManualTab(QWidget):
         if self.response_has_error(response):
             self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {response}")
         else:
+            self.safety_stop_latched = False
             self.log_signal.emit(f"CLEAR_FAULTS -> {response}")
 
     def send_pi_best_effort(self, command: str):
@@ -739,15 +761,33 @@ class ManualTab(QWidget):
         controller = self.parse_csv_response(controller_response, "CONTROLLER_STATE:")
         self.log_estop_transitions(inputs)
 
-        self.estop_active = inputs.get("ESTOP") == "1"
+        previous_estop_active = self.estop_active
+        previous_estop_raw_active = self.estop_raw_active
+        current_estop_raw_active = inputs.get("ESTOP_RAW") == "1"
+        reported_estop_active = inputs.get("ESTOP") == "1"
+        raw_estop_pressed = (
+            current_estop_raw_active
+            and previous_estop_raw_active is False
+        )
+        self.estop_raw_active = current_estop_raw_active
+        self.estop_active = reported_estop_active
         clearcore_fault = controller.get("FAULT") == "1"
         clearcore_homed = controller.get("M0_HOMED") == "1" and controller.get("M1_HOMED") == "1"
         self.system_homed = clearcore_homed and not self.home_sequence_active
 
-        if self.estop_active:
+        if reported_estop_active or raw_estop_pressed:
+            if raw_estop_pressed and not reported_estop_active:
+                self.log_signal.emit(
+                    "ClearCore raw E-stop input activated while override/filtering kept ESTOP=0"
+                )
+            if not previous_estop_active or raw_estop_pressed:
+                self.handle_estop_activated()
             self.system_faulted = True
-            self.set_machine_state("estop_active")
+            self.set_machine_state("estop_active" if reported_estop_active else "faulted")
         elif clearcore_fault and not self.home_sequence_active:
+            self.system_faulted = True
+            self.set_machine_state("faulted")
+        elif self.safety_stop_latched and not self.home_sequence_active:
             self.system_faulted = True
             self.set_machine_state("faulted")
         elif not self.home_sequence_active and not self.auto_cycle_running:
@@ -778,6 +818,7 @@ class ManualTab(QWidget):
             return
 
         normalized = (actuator_status or "").strip().upper()
+        self.update_actuator_motion_state(normalized)
         if self.actuator_state_label is not None and normalized:
             self.actuator_state_label.setText(f"State: {normalized}")
 
@@ -787,9 +828,20 @@ class ManualTab(QWidget):
                 self.set_machine_state("faulted")
 
     def update_clearcore_leds(self):
-        ready = int(self.machine_state == "ready")
-        running = int(self.machine_state in {"running", "homing", "actuator_retracting"})
-        fault = int(self.machine_state in {"faulted", "estop_active"})
+        homing_active = self.home_sequence_active or self.machine_state == "homing"
+        motion_active = self.motor_motion_active() or self.actuator_motion_active
+        homing_flash_on = homing_active and int(time.monotonic() * 2) % 2 == 0
+        running_active = self.auto_cycle_running or motion_active
+        fault_active = self.machine_state in {"faulted", "estop_active"}
+
+        ready = int(
+            self.machine_state == "ready"
+            and not running_active
+            and not homing_active
+            and not fault_active
+        )
+        running = int(not fault_active and (homing_flash_on or (running_active and not homing_active)))
+        fault = int(fault_active)
         led_state = (ready, running, fault)
         if led_state == self.last_led_state:
             return
@@ -842,21 +894,39 @@ class ManualTab(QWidget):
         self.set_machine_state("running")
         self.hardware_start_requested.emit()
 
-    def handle_hardware_stop(self):
+    def abort_motion_for_safety(self, reason: str, machine_state: str):
+        self.log_signal.emit(f"{reason}: aborting auto queue and stopping all motion")
         self.hardware_stop_requested.emit()
+
         if self.home_sequence_active:
             self.home_timer.stop()
             self.home_sequence_active = False
             self.home_step = None
             self.home_motor = None
             self.hide_homing_dialog()
-            self.log_signal.emit("Home sequence aborted by hardware STOP")
+            self.log_signal.emit(f"Home sequence aborted by {reason}")
+
+        self.motor_motion_direction = {"M0": "STOP", "M1": "STOP"}
+        self.actuator_motion_active = False
+        self.system_faulted = True
+        self.safety_stop_latched = True
+
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
             self.send_machine_best_effort(command)
-        if self.estop_active:
-            self.set_machine_state("estop_active")
-        else:
-            self.set_machine_state("stopped")
+
+        self.set_machine_state(machine_state)
+
+    def handle_estop_activated(self):
+        self.set_motor_status("M0", "fault")
+        self.set_motor_status("M1", "fault")
+        self.abort_motion_for_safety("ClearCore E-stop activated", "estop_active")
+        self.log_clearcore_diagnostics()
+
+    def handle_hardware_stop(self):
+        self.abort_motion_for_safety(
+            "Hardware STOP safety stop",
+            "estop_active" if self.estop_active else "faulted",
+        )
 
     def handle_hardware_home(self):
         if self.home_sequence_active:
@@ -926,6 +996,21 @@ class ManualTab(QWidget):
     def last_gpio_inputs(self):
         return self.parse_csv_response(self.last_gpio_inputs_response, "GPIO_INPUTS:")
 
+    def motor_motion_active(self):
+        return any(direction != "STOP" for direction in self.motor_motion_direction.values())
+
+    def actuator_status_is_moving(self, status: str):
+        return status in {"EXTENDING", "RETRACTING", "HOMING", "CYCLING"}
+
+    def update_actuator_motion_state(self, status: str):
+        if not status:
+            return
+        if self.actuator_status_is_moving(status):
+            self.actuator_motion_active = True
+        elif status in {"READY", "RETRACTED", "EXTENDED", "IDLE", "STOPPED", "FAULT"}:
+            self.actuator_motion_active = False
+        self.update_clearcore_leds()
+
     def pi_software_motion_gate_reason(self, cmd: str):
         if self.limit_override_active or self.home_sequence_active:
             return None
@@ -945,6 +1030,13 @@ class ManualTab(QWidget):
                 self.motor_motion_direction[motor_name] = "AWAY"
             elif cmd in {f"STOP_{motor_name}", f"DISABLE_{motor_name}"}:
                 self.motor_motion_direction[motor_name] = "STOP"
+
+        if cmd in {"EXTEND", "RETRACT", "CYCLE", "HOME", "HOME_ACTUATOR", "RETRACT_TO_HOME"}:
+            self.actuator_motion_active = True
+        elif cmd in {"STOP_ACTUATOR", "STOP"}:
+            self.actuator_motion_active = False
+
+        self.update_clearcore_leds()
 
     def enforce_pi_software_limits(self, gpio_inputs):
         if self.limit_override_active or self.home_sequence_active:
@@ -1002,10 +1094,21 @@ class ManualTab(QWidget):
         self.log_signal.emit(f"Home sequence -> {motor_name} seeking home switch ({source})")
         self.send_home_command(self.move_toward_home_command(motor_name))
 
+    def start_servo_home_backoff(self, motor_name: str):
+        self.send_home_command(f"STOP_{motor_name}")
+        self.home_step = "servo_backoff"
+        self.home_phase_started_at = time.monotonic()
+        inputs = self.read_clearcore_inputs_for_home()
+        source = inputs.get(f"{motor_name}_HOME_SOURCE", "ClearCore")
+        self.log_signal.emit(
+            f"Home sequence -> {motor_name} home switch hit; backing off ({source})"
+        )
+        self.send_home_command(self.move_away_from_home_command(motor_name))
+
     def complete_servo_home(self, motor_name: str):
         self.send_home_command(f"STOP_{motor_name}")
         self.send_home_command(f"SET_HOME_{motor_name}:1")
-        self.log_signal.emit(f"Home sequence -> {motor_name} home complete")
+        self.log_signal.emit(f"Home sequence -> {motor_name} home complete off switch")
         if motor_name == "M0":
             self.start_servo_home("M1")
         else:
@@ -1050,16 +1153,34 @@ class ManualTab(QWidget):
         if self.home_step == "servo_seek":
             if home_active:
                 try:
+                    self.start_servo_home_backoff(motor_name)
+                except Exception as e:
+                    self.fail_home_sequence(f"{motor_name} home backoff start failed: {e}")
+                return
+            if elapsed_s > self.home_seek_timeout_s:
+                self.fail_home_sequence(f"{motor_name} failed to reach home switch")
+            return
+
+        if self.home_step == "servo_backoff":
+            if limit_active:
+                self.fail_home_sequence(f"{motor_name} limit active while backing off home")
+                return
+            if not home_active:
+                try:
                     self.complete_servo_home(motor_name)
                 except Exception as e:
                     self.fail_home_sequence(f"{motor_name} home completion failed: {e}")
                 return
-            if elapsed_s > self.home_seek_timeout_s:
-                self.fail_home_sequence(f"{motor_name} failed to reach home switch")
+            if elapsed_s > self.home_backoff_timeout_s:
+                self.fail_home_sequence(
+                    f"{motor_name} failed to back off home switch; "
+                    f"{motor_name}_HOME stayed active"
+                )
 
     def start_home_sequence(self):
         self.send_machine_best_effort("CLEAR_FAULTS")
         self.send_machine_best_effort("CLEAR_FAULT")
+        self.safety_stop_latched = False
         self.home_sequence_active = True
         self.system_faulted = False
         self.system_homed = False
@@ -1086,6 +1207,7 @@ class ManualTab(QWidget):
         self.home_timer.start()
 
     def advance_home_sequence(self):
+        self.update_clearcore_leds()
         if not self.command_transport_ready() or not self.actuator_transport_ready():
             self.fail_home_sequence("Hardware link unavailable during homing")
             return
@@ -1123,7 +1245,7 @@ class ManualTab(QWidget):
                 return
             return
 
-        if self.home_step in {"servo_release", "servo_seek"}:
+        if self.home_step in {"servo_release", "servo_seek", "servo_backoff"}:
             try:
                 self.advance_servo_home_sequence()
             except Exception as e:
@@ -1369,6 +1491,15 @@ class ManualTab(QWidget):
             return
 
         normalized = (response or "").strip().upper()
+        if normalized.startswith("STARTED "):
+            self.actuator_motion_active = True
+            self.update_clearcore_leds()
+        elif normalized.startswith("DONE ") or normalized in {"STOPPED", "READY", "RETRACTED"}:
+            self.actuator_motion_active = False
+            self.update_clearcore_leds()
+        elif cmd == "STATUS_ACTUATOR":
+            self.update_actuator_motion_state(normalized)
+
         if cmd == "EXTEND" and normalized in {"STARTED EXTEND", "DONE EXTEND"}:
             self.actuator_state_label.setText("State: EXTENDING")
             if normalized == "DONE EXTEND":
@@ -1408,6 +1539,13 @@ class ManualTab(QWidget):
                 previous = self.last_motor_status[motor_name]
                 self.set_motor_status(motor_name, status)
                 self.set_motor_diag_text(motor_name, f"Diagnostics: status={status.upper()}")
+                if status == "fault":
+                    self.motor_motion_direction[motor_name] = "STOP"
+                    self.system_faulted = True
+                    self.set_machine_state("estop_active" if self.estop_active else "faulted")
+                elif status in {"disabled", "off"}:
+                    self.motor_motion_direction[motor_name] = "STOP"
+                    self.update_clearcore_leds()
                 if status != previous:
                     self.log_signal.emit(f"{motor_name} status -> {status.upper()}")
                     if status == "fault":
