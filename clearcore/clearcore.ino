@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v9"
+#define firmwareVersion "clearcore-dual-motor-v10"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -348,7 +348,9 @@ bool DisableMotorM1() {
 bool StopMotorM0() {
     if (!motor0Enabled) {
         motor0VelocitySelection = STOP_SELECTION;
-        return false;
+        motor0.MotorInAState(false);
+        motor0.MotorInBState(false);
+        return true;
     }
     return ApplyVelocitySelectionM0(STOP_SELECTION);
 }
@@ -356,7 +358,9 @@ bool StopMotorM0() {
 bool StopMotorM1() {
     if (!motor1Enabled) {
         motor1VelocitySelection = STOP_SELECTION;
-        return false;
+        motor1.MotorInAState(false);
+        motor1.MotorInBState(false);
+        return true;
     }
     return ApplyVelocitySelectionM1(STOP_SELECTION);
 }

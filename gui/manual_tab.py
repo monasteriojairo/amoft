@@ -70,6 +70,10 @@ class ManualTab(QWidget):
         self.home_phase_started_at = 0.0
         self.home_release_timeout_s = 5.0
         self.home_seek_timeout_s = 15.0
+        self.home_actuator_started_at = 0.0
+        self.home_actuator_seen_retracting = False
+        self.home_actuator_last_status = None
+        self.home_actuator_timeout_s = 12.0
         self.home_poll_attempts = 0
         self.last_led_state = None
         self.last_gpio_inputs_response = None
@@ -272,6 +276,11 @@ class ManualTab(QWidget):
             self.update_connection_label()
             return
 
+        if self.is_benign_stop_response(cmd, response):
+            self.track_motor_motion_from_command(cmd)
+            self.log_signal.emit(f"{cmd} -> {response} (already stopped)")
+            return
+
         if self.response_has_error(response):
             self.log_signal.emit(f"Command failed ({cmd}): {response}")
             self.command_failed_signal.emit(cmd, response)
@@ -306,6 +315,10 @@ class ManualTab(QWidget):
             key, value = part.split("=", 1)
             parsed[key.strip()] = value.strip()
         return parsed
+
+    def is_benign_stop_response(self, cmd: str, response: str):
+        normalized = (response or "").strip().upper()
+        return cmd in {"STOP_M0", "STOP_M1"} and normalized == f"ERR {cmd}"
 
     def set_machine_state(self, state: str):
         self.machine_state = state
@@ -615,8 +628,13 @@ class ManualTab(QWidget):
             "Hardware START gate -> "
             f"estop={int(self.estop_active)} "
             f"faulted={int(self.system_faulted)} "
-            f"homed={int(self.system_homed)}"
+            f"homed={int(self.system_homed)} "
+            f"homing={int(self.home_sequence_active)}"
         )
+        if self.home_sequence_active:
+            self.log_signal.emit("Hardware START rejected: homing active")
+            self.set_machine_state("homing")
+            return
         if self.estop_active:
             self.log_signal.emit("Hardware START rejected: E-stop active")
             self.set_machine_state("estop_active")
@@ -632,6 +650,12 @@ class ManualTab(QWidget):
 
     def handle_hardware_stop(self):
         self.hardware_stop_requested.emit()
+        if self.home_sequence_active:
+            self.home_timer.stop()
+            self.home_sequence_active = False
+            self.home_step = None
+            self.home_motor = None
+            self.log_signal.emit("Home sequence aborted by hardware STOP")
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
             self.send_machine_best_effort(command)
         if self.estop_active:
@@ -844,11 +868,14 @@ class ManualTab(QWidget):
         self.home_step = "actuator_retract"
         self.home_motor = None
         self.home_poll_attempts = 0
+        self.home_actuator_started_at = time.monotonic()
+        self.home_actuator_seen_retracting = False
+        self.home_actuator_last_status = None
         self.set_machine_state("actuator_retracting")
-        self.log_signal.emit("Home sequence -> retracting actuator before servo homing")
+        self.log_signal.emit("Home sequence -> timed actuator retract before servo homing")
 
         try:
-            response = self.send_home_command("RETRACT_TO_HOME")
+            response = self.send_home_command("RETRACT")
         except Exception as e:
             self.fail_home_sequence(f"Actuator retract command failed: {e}")
             return
@@ -873,13 +900,26 @@ class ManualTab(QWidget):
                 return
 
             self.actuator_state_label.setText(f"State: {status}")
-            if status == "RETRACTED":
+            if status != self.home_actuator_last_status:
+                self.log_signal.emit(f"Home sequence -> actuator status {status}")
+                self.home_actuator_last_status = status
+
+            if status in {"RETRACTING", "HOMING"}:
+                self.home_actuator_seen_retracting = True
+                return
+
+            retract_elapsed_s = time.monotonic() - self.home_actuator_started_at
+            if status == "RETRACTED" or (
+                status == "READY" and self.home_actuator_seen_retracting
+            ):
                 try:
+                    self.log_signal.emit("Home sequence -> actuator retract complete")
                     self.start_servo_home("M0")
                 except Exception as e:
                     self.fail_home_sequence(f"M0 software home setup failed: {e}")
                 return
-            if status == "FAULT" or self.home_poll_attempts > 60:
+
+            if status == "FAULT" or retract_elapsed_s > self.home_actuator_timeout_s:
                 self.fail_home_sequence("Actuator failed to reach retracted state")
                 return
             return
