@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v8"
+#define firmwareVersion "clearcore-dual-motor-v9"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -281,6 +281,13 @@ void MonitorSafetyInputs() {
         DisableMotorM0();
         DisableMotorM1();
         return;
+    }
+
+    if (controllerFaultFromEstop &&
+        !motor0.StatusReg().bit.MotorInFault &&
+        !motor1.StatusReg().bit.MotorInFault) {
+        controllerFaultLatched = false;
+        controllerFaultFromEstop = false;
     }
 
     if (LIMIT_INTERLOCK_ENABLED && motor0Enabled && motor0VelocitySelection != STOP_SELECTION) {

@@ -188,6 +188,7 @@ class ManualTab(QWidget):
             self.update_supervisor_timer()
             self.sync_estop_override_state()
             self.sync_limit_override_state()
+            self.clear_inactive_estop_latch()
             self.log_clearcore_diagnostics()
             self.status_timer.start()
             self.update_connection_label()
@@ -395,6 +396,42 @@ class ManualTab(QWidget):
         self.set_limit_override_checked(checked)
         state = "ON" if checked else "OFF"
         self.log_signal.emit(f"Pi software limit/home override -> {state}")
+
+    def clear_inactive_estop_latch(self):
+        if not self.command_transport_ready():
+            return
+
+        try:
+            inputs_response = self.send_raw_command("INPUTS")
+            faults_response = self.send_raw_command("FAULTS")
+        except Exception as e:
+            self.log_signal.emit(f"Startup fault clear skipped: {e}")
+            return
+
+        inputs = self.parse_csv_response(inputs_response, "INPUTS:")
+        faults = self.parse_csv_response(faults_response, "FAULTS:")
+        stale_estop_latch = (
+            inputs.get("ESTOP") == "0"
+            and faults.get("LATCH") == "1"
+            and faults.get("LATCH_ESTOP") == "1"
+            and faults.get("M0_DRIVER") != "1"
+            and faults.get("M1_DRIVER") != "1"
+        )
+        if not stale_estop_latch:
+            return
+
+        self.log_signal.emit("Startup fault clear: stale E-stop latch detected")
+        self.log_signal.emit("Command given -> CLEAR_FAULTS")
+        try:
+            response = self.route_command("CLEAR_FAULTS")
+        except Exception as e:
+            self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {e}")
+            return
+
+        if self.response_has_error(response):
+            self.log_signal.emit(f"Command failed (CLEAR_FAULTS): {response}")
+        else:
+            self.log_signal.emit(f"CLEAR_FAULTS -> {response}")
 
     def send_pi_best_effort(self, command: str):
         return self.send_machine_best_effort(command)
