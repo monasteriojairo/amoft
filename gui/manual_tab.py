@@ -3,7 +3,8 @@ import time
 from PySide6.QtCore import Signal, QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QPushButton,
-    QLabel, QGridLayout, QComboBox, QCheckBox, QSizePolicy
+    QLabel, QGridLayout, QComboBox, QCheckBox, QSizePolicy,
+    QDialog, QProgressBar
 )
 
 from controllers.arduino_controller import ArduinoController
@@ -51,6 +52,7 @@ class ManualTab(QWidget):
         self.arduino_diag_label = None
         self.actuator_state_label = None
         self.actuator_limits_label = None
+        self.clearcore_capabilities = ""
         self.machine_state_label = None
         self.machine_inputs_label = None
         self.estop_override_checkbox = None
@@ -75,8 +77,18 @@ class ManualTab(QWidget):
         self.home_actuator_last_status = None
         self.home_actuator_timeout_s = 12.0
         self.home_poll_attempts = 0
+        self.homing_dialog = None
+        self.homing_dialog_label = None
+        self.homing_dialog_phase = 0
         self.last_led_state = None
         self.last_gpio_inputs_response = None
+        self.gpio_pin_map = {"M0_HOME": "23", "M1_HOME": "24"}
+        self.last_home_switch_snapshot = {
+            "M0_HOME": {"state": None, "raw": None},
+            "M1_HOME": {"state": None, "raw": None},
+        }
+        self.last_home_switch_change = None
+        self.last_estop_snapshot = {"state": None, "raw": None, "override": None}
 
         layout = QHBoxLayout(self)
 
@@ -107,6 +119,9 @@ class ManualTab(QWidget):
         self.home_timer = QTimer(self)
         self.home_timer.setInterval(300)
         self.home_timer.timeout.connect(self.advance_home_sequence)
+        self.homing_dialog_timer = QTimer(self)
+        self.homing_dialog_timer.setInterval(300)
+        self.homing_dialog_timer.timeout.connect(self.update_homing_dialog)
         self.auto_retry_timer = QTimer(self)
         self.auto_retry_timer.setInterval(5000)
         self.auto_retry_timer.timeout.connect(self.auto_retry_devices)
@@ -131,8 +146,10 @@ class ManualTab(QWidget):
             if self.pi_connected:
                 gpio_config = self.pi_client.send("GPIO_CONFIG")
                 self.log_signal.emit(gpio_config)
+                self.cache_gpio_config(gpio_config)
                 serial_ports = self.pi_client.send("SERIAL_PORTS")
                 self.log_signal.emit(serial_ports)
+                self.log_firmware_identity()
                 self.status_timer.start()
                 self.update_supervisor_timer()
                 self.sync_estop_override_state()
@@ -188,7 +205,9 @@ class ManualTab(QWidget):
             self.set_motor_status("M0", "disabled")
             self.set_motor_status("M1", "disabled")
             if self.local_gpio.enabled:
-                self.log_signal.emit(f"Local {self.local_gpio.config_summary()}")
+                gpio_config = self.local_gpio.config_summary()
+                self.log_signal.emit(f"Local {gpio_config}")
+                self.cache_gpio_config(gpio_config)
             self.update_supervisor_timer()
             self.sync_estop_override_state()
             self.sync_limit_override_state()
@@ -316,6 +335,127 @@ class ManualTab(QWidget):
             parsed[key.strip()] = value.strip()
         return parsed
 
+    def cache_gpio_config(self, response: str):
+        config = self.parse_csv_response(response, "GPIO_CONFIG:")
+        if not config:
+            return
+
+        for key in ("M0_HOME", "M1_HOME"):
+            pin_key = f"{key}_PIN"
+            if pin_key in config:
+                self.gpio_pin_map[key] = config[pin_key]
+
+        m0_pin = self.gpio_pin_map.get("M0_HOME", "?")
+        m1_pin = self.gpio_pin_map.get("M1_HOME", "?")
+        self.log_signal.emit(
+            f"Pi home switch mapping -> M0_HOME=GPIO{m0_pin}, M1_HOME=GPIO{m1_pin}"
+        )
+        if m0_pin == m1_pin:
+            self.log_signal.emit(
+                "Pi home switch warning -> M0_HOME and M1_HOME are configured for the same GPIO pin"
+            )
+
+    def log_home_switch_transitions(self, gpio_inputs):
+        changed = []
+        changed_after_initial = []
+        for key in ("M0_HOME", "M1_HOME"):
+            state = gpio_inputs.get(key)
+            raw = gpio_inputs.get(f"{key}_RAW")
+            if state is None and raw is None:
+                continue
+
+            previous = self.last_home_switch_snapshot[key]
+            had_previous = previous["state"] is not None or previous["raw"] is not None
+            if previous["state"] == state and previous["raw"] == raw:
+                continue
+
+            previous["state"] = state
+            previous["raw"] = raw
+            changed.append(key)
+            if had_previous:
+                changed_after_initial.append(key)
+                self.last_home_switch_change = {
+                    "time": time.monotonic(),
+                    "key": key,
+                    "state": state,
+                    "raw": raw,
+                }
+
+            pin = self.gpio_pin_map.get(key, "?")
+            status = "ACTIVE" if state == "1" else "INACTIVE"
+            self.log_signal.emit(
+                f"Pi home switch {key} GPIO{pin} -> {status} raw={raw if raw is not None else '?'}"
+            )
+
+        if len(changed_after_initial) > 1:
+            pins = ", ".join(
+                f"{key}=GPIO{self.gpio_pin_map.get(key, '?')}" for key in changed_after_initial
+            )
+            self.log_signal.emit(
+                "Pi home switch warning -> multiple home switches changed together "
+                f"({pins}); if only one physical switch moved, check for a shared node or jumper"
+            )
+
+    def log_estop_transitions(self, inputs):
+        state = inputs.get("ESTOP")
+        raw = inputs.get("ESTOP_RAW")
+        override = inputs.get("ESTOP_OVERRIDE")
+        if state is None and raw is None and override is None:
+            return
+
+        previous = self.last_estop_snapshot
+        had_previous = (
+            previous["state"] is not None
+            or previous["raw"] is not None
+            or previous["override"] is not None
+        )
+        if (
+            previous["state"] == state
+            and previous["raw"] == raw
+            and previous["override"] == override
+        ):
+            return
+
+        previous["state"] = state
+        previous["raw"] = raw
+        previous["override"] = override
+        status = "ACTIVE" if state == "1" else "INACTIVE"
+        self.log_signal.emit(
+            f"ClearCore E-stop input -> {status} raw={raw if raw is not None else '?'} "
+            f"override={override if override is not None else '?'}"
+        )
+        if state == "1":
+            self.log_clearcore_pin_states("E-stop transition")
+
+        if not had_previous or state != "1" or not self.last_home_switch_change:
+            return
+
+        elapsed_s = time.monotonic() - self.last_home_switch_change["time"]
+        if elapsed_s > 2.0:
+            return
+
+        key = self.last_home_switch_change["key"]
+        pin = self.gpio_pin_map.get(key, "?")
+        home_state = self.last_home_switch_change.get("state")
+        home_status = "ACTIVE" if home_state == "1" else "INACTIVE"
+        self.log_signal.emit(
+            "ClearCore E-stop warning -> E-stop tripped "
+            f"{elapsed_s:.1f}s after {key} GPIO{pin} became {home_status}; "
+            "check that this home switch is not tied to ClearCore IO-0 or the E-stop circuit"
+        )
+
+    def clearcore_supports_pin_states(self):
+        return "PIN_STATES" in (self.clearcore_capabilities or "").upper()
+
+    def log_clearcore_pin_states(self, reason: str):
+        if not self.clearcore_supports_pin_states() or not self.command_transport_ready():
+            return
+        try:
+            response = self.send_raw_command("PIN_STATES")
+            self.log_signal.emit(f"ClearCore {reason} PIN_STATES -> {response}")
+        except Exception as e:
+            self.log_signal.emit(f"ClearCore PIN_STATES failed ({reason}): {e}")
+
     def is_benign_stop_response(self, cmd: str, response: str):
         normalized = (response or "").strip().upper()
         return cmd in {"STOP_M0", "STOP_M1"} and normalized == f"ERR {cmd}"
@@ -329,6 +469,58 @@ class ManualTab(QWidget):
     def set_machine_inputs_text(self, text: str):
         if self.machine_inputs_label is not None:
             self.machine_inputs_label.setText(text)
+
+    def show_homing_dialog(self):
+        if self.homing_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Homing")
+            dialog.setModal(False)
+            dialog.setFixedSize(340, 150)
+
+            layout = QVBoxLayout(dialog)
+            self.homing_dialog_label = QLabel("HOMING,,,,,")
+            self.homing_dialog_label.setAlignment(Qt.AlignCenter)
+            self.homing_dialog_label.setStyleSheet("font-size: 24px; font-weight: bold;")
+
+            progress = QProgressBar()
+            progress.setRange(0, 0)
+
+            note = QLabel("Keep hands clear. Press STOP to abort.")
+            note.setAlignment(Qt.AlignCenter)
+            note.setWordWrap(True)
+
+            layout.addWidget(self.homing_dialog_label)
+            layout.addWidget(progress)
+            layout.addWidget(note)
+            self.homing_dialog = dialog
+
+        self.homing_dialog_phase = 0
+        self.update_homing_dialog()
+        self.center_homing_dialog()
+        self.homing_dialog.show()
+        self.homing_dialog.raise_()
+        self.homing_dialog_timer.start()
+
+    def center_homing_dialog(self):
+        if self.homing_dialog is None:
+            return
+        parent_rect = self.window().frameGeometry()
+        dialog_rect = self.homing_dialog.frameGeometry()
+        dialog_rect.moveCenter(parent_rect.center())
+        self.homing_dialog.move(dialog_rect.topLeft())
+
+    def update_homing_dialog(self):
+        if self.homing_dialog_label is None:
+            return
+        comma_count = 1 + (self.homing_dialog_phase % 5)
+        self.homing_dialog_label.setText("HOMING" + ("," * comma_count))
+        self.homing_dialog_phase += 1
+
+    def hide_homing_dialog(self):
+        if hasattr(self, "homing_dialog_timer"):
+            self.homing_dialog_timer.stop()
+        if self.homing_dialog is not None:
+            self.homing_dialog.hide()
 
     def set_estop_override_checked(self, checked: bool):
         self.estop_override_active = checked
@@ -542,8 +734,10 @@ class ManualTab(QWidget):
             self.last_gpio_inputs_response = gpio_input_response
 
         gpio_inputs = self.parse_csv_response(gpio_input_response, "GPIO_INPUTS:")
+        self.log_home_switch_transitions(gpio_inputs)
         inputs = self.parse_csv_response(clearcore_input_response, "INPUTS:")
         controller = self.parse_csv_response(controller_response, "CONTROLLER_STATE:")
+        self.log_estop_transitions(inputs)
 
         self.estop_active = inputs.get("ESTOP") == "1"
         clearcore_fault = controller.get("FAULT") == "1"
@@ -655,6 +849,7 @@ class ManualTab(QWidget):
             self.home_sequence_active = False
             self.home_step = None
             self.home_motor = None
+            self.hide_homing_dialog()
             self.log_signal.emit("Home sequence aborted by hardware STOP")
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
             self.send_machine_best_effort(command)
@@ -784,7 +979,7 @@ class ManualTab(QWidget):
 
         inputs = self.read_clearcore_inputs_for_home()
         if inputs.get("ESTOP") == "1":
-            self.fail_home_sequence("E-stop active before servo homing")
+            self.fail_home_sequence(self.format_estop_home_abort("before servo homing", inputs))
             return
 
         if self.home_input_active(inputs, motor_name):
@@ -824,7 +1019,7 @@ class ManualTab(QWidget):
 
         inputs = self.read_clearcore_inputs_for_home()
         if inputs.get("ESTOP") == "1":
-            self.fail_home_sequence("E-stop active during servo homing")
+            self.fail_home_sequence(self.format_estop_home_abort("during servo homing", inputs))
             return
 
         elapsed_s = time.monotonic() - self.home_phase_started_at
@@ -846,7 +1041,10 @@ class ManualTab(QWidget):
                     self.fail_home_sequence(f"{motor_name} release stop failed: {e}")
                 return
             if elapsed_s > self.home_release_timeout_s:
-                self.fail_home_sequence(f"{motor_name} failed to release home switch")
+                self.fail_home_sequence(
+                    f"{motor_name} failed to release home switch; "
+                    f"{motor_name}_HOME stayed active"
+                )
             return
 
         if self.home_step == "servo_seek":
@@ -872,6 +1070,7 @@ class ManualTab(QWidget):
         self.home_actuator_seen_retracting = False
         self.home_actuator_last_status = None
         self.set_machine_state("actuator_retracting")
+        self.show_homing_dialog()
         self.log_signal.emit("Home sequence -> timed actuator retract before servo homing")
 
         try:
@@ -938,10 +1137,19 @@ class ManualTab(QWidget):
         self.home_motor = None
         self.system_faulted = True
         self.system_homed = False
+        self.hide_homing_dialog()
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
             self.send_machine_best_effort(command)
         self.set_machine_state("faulted")
         self.log_signal.emit(message)
+
+    def format_estop_home_abort(self, context: str, inputs):
+        return (
+            f"E-stop active {context}; "
+            f"ESTOP={inputs.get('ESTOP', '?')} "
+            f"ESTOP_RAW={inputs.get('ESTOP_RAW', '?')} "
+            f"ESTOP_OVERRIDE={inputs.get('ESTOP_OVERRIDE', '?')}"
+        )
 
     def complete_home_sequence(self):
         self.home_timer.stop()
@@ -950,6 +1158,7 @@ class ManualTab(QWidget):
         self.home_motor = None
         self.system_faulted = False
         self.system_homed = True
+        self.hide_homing_dialog()
         self.set_machine_state("ready")
         self.log_signal.emit("Home sequence complete")
 
@@ -1243,6 +1452,7 @@ class ManualTab(QWidget):
             caps = identity.get("CAPS") if identity is not None else None
             if caps is None:
                 caps = self.send_raw_command("CAPS")
+            self.clearcore_capabilities = caps or ""
             self.log_signal.emit(f"ClearCore capabilities: {caps}")
         except Exception as e:
             self.log_signal.emit(f"ClearCore capability check failed: {e}")
@@ -1252,7 +1462,7 @@ class ManualTab(QWidget):
             return
 
         diagnostic_responses = {}
-        for command in (
+        commands = [
             "INPUTS",
             "CONTROLLER_STATE",
             "FAULTS",
@@ -1261,7 +1471,11 @@ class ManualTab(QWidget):
             "LIMITS_M1",
             "STATUS_M0",
             "STATUS_M1",
-        ):
+        ]
+        if self.clearcore_supports_pin_states():
+            commands.insert(1, "PIN_STATES")
+
+        for command in commands:
             try:
                 response = self.send_raw_command(command)
                 diagnostic_responses[command] = response
@@ -1633,12 +1847,24 @@ class ManualTab(QWidget):
                 try:
                     response = self.pi_client.send(command)
                     self.log_signal.emit(f"GPIO check {command} -> {response}")
+                    if command == "GPIO_CONFIG":
+                        self.cache_gpio_config(response)
+                    elif command == "GPIO_INPUTS":
+                        self.log_home_switch_transitions(
+                            self.parse_csv_response(response, "GPIO_INPUTS:")
+                        )
                 except Exception as e:
                     self.log_signal.emit(f"GPIO check failed ({command}): {e}")
             return
 
-        self.log_signal.emit(f"GPIO check GPIO_CONFIG -> {self.local_gpio.config_summary()}")
-        self.log_signal.emit(f"GPIO check GPIO_INPUTS -> {self.local_gpio.input_summary()}")
+        gpio_config = self.local_gpio.config_summary()
+        gpio_inputs = self.local_gpio.input_summary()
+        self.log_signal.emit(f"GPIO check GPIO_CONFIG -> {gpio_config}")
+        self.cache_gpio_config(gpio_config)
+        self.log_signal.emit(f"GPIO check GPIO_INPUTS -> {gpio_inputs}")
+        self.log_home_switch_transitions(
+            self.parse_csv_response(gpio_inputs, "GPIO_INPUTS:")
+        )
 
     def create_connection_group(self):
         box = QGroupBox("Connection / Ports")

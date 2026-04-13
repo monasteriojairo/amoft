@@ -227,19 +227,32 @@ class PiGpioManager:
             return event_name
 
     def input_summary(self) -> str:
-        self.poll()
         with self._lock:
             try:
                 raw_states = self._read_input_raws()
             except Exception as exc:
                 self.backend_error = str(exc)
                 raw_states = {name: "NA" for name in self.input_pins}
+                current_states = {**self._button_states, **self._home_switch_states}
+            else:
+                current_states = {
+                    name: self._decode_named_input(name, raw_states[name])
+                    for name in self.input_pins
+                }
+                for name in self.button_pins:
+                    current = current_states[name]
+                    previous = self._button_states.get(name, False)
+                    if current and not previous:
+                        self._latch_event(name)
+                    self._button_states[name] = current
+                for name in self.home_switch_pins:
+                    self._home_switch_states[name] = current_states[name]
             return (
-                f"GPIO_INPUTS:START={int(self._button_states['START'])},"
-                f"STOP={int(self._button_states['STOP'])},"
-                f"HOME={int(self._button_states['HOME'])},"
-                f"M0_HOME={int(self._home_switch_states['M0_HOME'])},"
-                f"M1_HOME={int(self._home_switch_states['M1_HOME'])},"
+                f"GPIO_INPUTS:START={int(current_states['START'])},"
+                f"STOP={int(current_states['STOP'])},"
+                f"HOME={int(current_states['HOME'])},"
+                f"M0_HOME={int(current_states['M0_HOME'])},"
+                f"M1_HOME={int(current_states['M1_HOME'])},"
                 f"START_RAW={raw_states['START']},"
                 f"STOP_RAW={raw_states['STOP']},"
                 f"HOME_RAW={raw_states['HOME']},"

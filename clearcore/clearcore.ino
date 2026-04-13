@@ -12,7 +12,7 @@
 #define m1LimitSwitch ConnectorA10
 
 #define baudRate 9600
-#define firmwareVersion "clearcore-dual-motor-v10"
+#define firmwareVersion "clearcore-dual-motor-v11"
 
 static const int STOP_SELECTION = 1;
 static const int POSITIVE_SELECTION = 2;
@@ -52,6 +52,7 @@ String HomeStatusM1();
 String LimitStatusM0();
 String LimitStatusM1();
 String InputSummary();
+String PinStateSummary();
 String ControllerStateSummary();
 String FaultSummary();
 String EstopOverrideSummary();
@@ -137,8 +138,9 @@ String HandleCommand(const String &rawCmd) {
     if (cmd == "PING_M0") return "PONG_M0";
     if (cmd == "PING_M1") return "PONG_M1";
     if (cmd == "VERSION") return firmwareVersion;
-    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,LIMITS_REPORT_ONLY,PI_LIMIT_OWNER,ESTOP_OVERRIDE";
+    if (cmd == "CAPS") return "CAPS:M0,M1,STATUS,HOME,LIMITS,INPUTS,FAULTS,ESTOP_IO0,SOFTWARE_HOME,LIMITS_REPORT_ONLY,PI_LIMIT_OWNER,ESTOP_OVERRIDE,PIN_STATES";
     if (cmd == "INPUTS") return InputSummary();
+    if (cmd == "PIN_STATES" || cmd == "PINS") return PinStateSummary();
     if (cmd == "CONTROLLER_STATE") return ControllerStateSummary();
     if (cmd == "FAULTS") return FaultSummary();
     if (cmd == "ESTOP_OVERRIDE") return EstopOverrideSummary();
@@ -570,6 +572,20 @@ String InputSummary() {
            ",M1_HOME_RAW=" + (RawM1HomeActive() ? "1" : "0") +
            ",M1_LIMIT=" + (M1LimitActive() ? "1" : "0") +
            ",M1_LIMIT_RAW=" + (RawM1LimitActive() ? "1" : "0");
+}
+
+String PinStateSummary() {
+    return String("PINS:ESTOP_STATE=") + String((int)estopStatus.State()) +
+           ",ESTOP_ACTIVE=" + (RawEstopActive() ? "1" : "0") +
+           ",ESTOP_ACTIVE_LOW=" + (ESTOP_ACTIVE_LOW ? "1" : "0") +
+           ",M0_HOME_STATE=" + String((int)m0HomeSwitch.State()) +
+           ",M0_HOME_ACTIVE=" + (RawM0HomeActive() ? "1" : "0") +
+           ",M0_LIMIT_STATE=" + String((int)m0LimitSwitch.State()) +
+           ",M0_LIMIT_ACTIVE=" + (RawM0LimitActive() ? "1" : "0") +
+           ",M1_HOME_STATE=" + String((int)m1HomeSwitch.State()) +
+           ",M1_HOME_ACTIVE=" + (RawM1HomeActive() ? "1" : "0") +
+           ",M1_LIMIT_STATE=" + String((int)m1LimitSwitch.State()) +
+           ",M1_LIMIT_ACTIVE=" + (RawM1LimitActive() ? "1" : "0");
 }
 
 String ControllerStateSummary() {
