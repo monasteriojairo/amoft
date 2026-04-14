@@ -6,6 +6,7 @@ from gui.auto_tab import AutoTab
 from gui.diagnostics_tab import DiagnosticsTab
 from gui.manual_tab import ManualTab
 from gui.settings_tab import SettingsTab
+from gui.validation_tab import ValidationTab
 
 
 class StatusIndicator(QLabel):
@@ -31,11 +32,13 @@ class MainWindow(QMainWindow):
 
         self.manual_tab = ManualTab()
         self.auto_tab = AutoTab()
+        self.validation_tab = ValidationTab()
         self.diagnostics_tab = DiagnosticsTab()
         self.settings_tab = SettingsTab()
 
         self.tabs.addTab(self.manual_tab, "Manual")
         self.tabs.addTab(self.auto_tab, "Auto")
+        self.tabs.addTab(self.validation_tab, "Validation")
         self.tabs.addTab(self.diagnostics_tab, "Diagnostics")
         self.tabs.addTab(self.settings_tab, "Settings")
 
@@ -52,10 +55,16 @@ class MainWindow(QMainWindow):
 
         self.manual_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.auto_tab.log_signal.connect(self.diagnostics_tab.append_log)
+        self.validation_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.auto_tab.command_signal.connect(self.manual_tab.send_command)
         self.manual_tab.command_failed_signal.connect(self.auto_tab.handle_command_failure)
         self.auto_tab.reconnect_signal.connect(self.reconnect_from_auto)
         self.auto_tab.cycle_state_signal.connect(self.manual_tab.on_cycle_state_changed)
+        self.auto_tab.cycle_state_signal.connect(self.validation_tab.on_auto_cycle_state_changed)
+        self.validation_tab.validation_mode_signal.connect(self.set_validation_mode)
+        self.validation_tab.start_sequence_signal.connect(self.start_validation_sequence)
+        self.validation_tab.abort_signal.connect(self.auto_tab.abort_from_hardware)
+        self.validation_tab.sensor_poll_signal.connect(self.update_validation_sensors)
         self.settings_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.manual_tab.pi_connection_signal.connect(self.update_pi_status)
         self.manual_tab.clearcore_connection_signal.connect(self.update_clearcore_status)
@@ -64,6 +73,17 @@ class MainWindow(QMainWindow):
         self.manual_tab.m1_status_signal.connect(self.update_m1_status)
         self.manual_tab.hardware_start_requested.connect(self.auto_tab.start_from_hardware)
         self.manual_tab.hardware_stop_requested.connect(self.auto_tab.abort_from_hardware)
+
+    def set_validation_mode(self, enabled: bool):
+        self.auto_tab.set_external_lock(enabled, "Validation mode" if enabled else "")
+
+    def start_validation_sequence(self, steps: list, label: str):
+        started = self.auto_tab.start_external_sequence(steps, label)
+        self.validation_tab.on_validation_start_result(started)
+
+    def update_validation_sensors(self):
+        response = self.manual_tab.read_validation_sensor_inputs()
+        self.validation_tab.update_sensor_inputs(response)
 
     def reconnect_from_auto(self):
         self.manual_tab.disconnect_all()

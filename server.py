@@ -94,6 +94,9 @@ def handle_gpio_command(cmd: str):
     if cmd == "GPIO_OUTPUTS":
         return gpio.output_summary()
 
+    if cmd == "GPIO_VALIDATION_INPUTS":
+        return gpio.validation_input_summary()
+
     if cmd == "GPIO_TEST_LEDS":
         return gpio.test_leds()
 

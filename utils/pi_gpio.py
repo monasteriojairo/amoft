@@ -55,7 +55,18 @@ class PiGpioManager:
             "M0_HOME": gpio_config.get("m0_home_pin", 23),
             "M1_HOME": gpio_config.get("m1_home_pin", 24),
         }
-        self.input_pins = {**self.button_pins, **self.home_switch_pins}
+        self.validation_sensors_enabled = bool(
+            gpio_config.get("validation_sensors_enabled", True)
+        )
+        self.validation_sensor_pins = {
+            "ROLL_PROX": gpio_config.get("roll_prox_pin", 20),
+            "TILT_PROX": gpio_config.get("tilt_prox_pin", 21),
+        } if self.validation_sensors_enabled else {}
+        self.input_pins = {
+            **self.button_pins,
+            **self.home_switch_pins,
+            **self.validation_sensor_pins,
+        }
         self.led_pins = {
             "READY": gpio_config.get("ready_led_pin", 5),
             "RUNNING": gpio_config.get("running_led_pin", 6),
@@ -71,6 +82,12 @@ class PiGpioManager:
             gpio_config.get("home_switches_active_high", self.home_switches_normally_closed)
         )
         self.home_switch_pull_up = bool(gpio_config.get("home_switch_pull_up", True))
+        self.validation_sensor_active_high = bool(
+            gpio_config.get("validation_sensor_active_high", False)
+        )
+        self.validation_sensor_pull_up = bool(
+            gpio_config.get("validation_sensor_pull_up", True)
+        )
         self.default_led_active_high = bool(gpio_config.get("leds_active_high", True))
         self.led_active_high = {
             "READY": bool(gpio_config.get("ready_led_active_high", self.default_led_active_high)),
@@ -86,6 +103,9 @@ class PiGpioManager:
         self._pending_event = "NONE"
         self._button_states = {name: False for name in self.button_pins}
         self._home_switch_states = {name: False for name in self.home_switch_pins}
+        self._validation_sensor_states = {
+            name: False for name in self.validation_sensor_pins
+        }
         self._led_states = {name: False for name in self.led_pins}
         self._raw_led_levels = None
         self._led_output_states = {name: None for name in self.led_pins}
@@ -98,6 +118,9 @@ class PiGpioManager:
 
                 button_pull_mode = GPIO.PUD_UP if self.button_pull_up else GPIO.PUD_DOWN
                 home_pull_mode = GPIO.PUD_UP if self.home_switch_pull_up else GPIO.PUD_DOWN
+                validation_pull_mode = (
+                    GPIO.PUD_UP if self.validation_sensor_pull_up else GPIO.PUD_DOWN
+                )
 
                 for pin in self.button_pins.values():
                     GPIO.setup(pin, GPIO.IN, pull_up_down=button_pull_mode)
@@ -105,6 +128,13 @@ class PiGpioManager:
                 for pin in self.home_switch_pins.values():
                     if pin not in self.button_pins.values():
                         GPIO.setup(pin, GPIO.IN, pull_up_down=home_pull_mode)
+
+                for pin in self.validation_sensor_pins.values():
+                    if pin not in {
+                        *self.button_pins.values(),
+                        *self.home_switch_pins.values(),
+                    }:
+                        GPIO.setup(pin, GPIO.IN, pull_up_down=validation_pull_mode)
 
                 for name, pin in self.led_pins.items():
                     GPIO.setup(pin, GPIO.OUT, initial=self._encode_output(name, False))
@@ -117,6 +147,10 @@ class PiGpioManager:
                 self._home_switch_states = {
                     name: initial_states[name]
                     for name in self.home_switch_pins
+                }
+                self._validation_sensor_states = {
+                    name: initial_states[name]
+                    for name in self.validation_sensor_pins
                 }
             except Exception as exc:
                 self.available = False
@@ -143,6 +177,10 @@ class PiGpioManager:
                     name: initial_states[name]
                     for name in self.home_switch_pins
                 }
+                self._validation_sensor_states = {
+                    name: initial_states[name]
+                    for name in self.validation_sensor_pins
+                }
             except Exception as exc:
                 self.available = False
                 self.backend = None
@@ -164,6 +202,12 @@ class PiGpioManager:
         return bool(raw_value) if self.button_active_high else not bool(raw_value)
 
     def _decode_named_input(self, name: str, raw_value: int) -> bool:
+        if name in self.validation_sensor_pins:
+            return (
+                bool(raw_value)
+                if self.validation_sensor_active_high
+                else not bool(raw_value)
+            )
         if name in self.home_switch_pins:
             return bool(raw_value) if self.home_switches_active_high else not bool(raw_value)
         return self._decode_input(raw_value)
@@ -241,6 +285,11 @@ class PiGpioManager:
             self.home_switch_pins,
             self.home_switch_pull_up,
         ))
+        if self.validation_sensor_pins:
+            raw_states.update(self._gpioget_raws_for_pins(
+                self.validation_sensor_pins,
+                self.validation_sensor_pull_up,
+            ))
         return raw_states
 
     def _stop_gpioset_process(self, name=None):
@@ -553,6 +602,8 @@ class PiGpioManager:
                 self._button_states[name] = current
             for name in self.home_switch_pins:
                 self._home_switch_states[name] = current_states[name]
+            for name in self.validation_sensor_pins:
+                self._validation_sensor_states[name] = current_states[name]
 
     def get_event(self) -> str:
         self.poll()
@@ -568,7 +619,11 @@ class PiGpioManager:
             except Exception as exc:
                 self.backend_error = str(exc)
                 raw_states = {name: "NA" for name in self.input_pins}
-                current_states = {**self._button_states, **self._home_switch_states}
+                current_states = {
+                    **self._button_states,
+                    **self._home_switch_states,
+                    **self._validation_sensor_states,
+                }
             else:
                 current_states = {
                     name: self._decode_named_input(name, raw_states[name])
@@ -582,6 +637,15 @@ class PiGpioManager:
                     self._button_states[name] = current
                 for name in self.home_switch_pins:
                     self._home_switch_states[name] = current_states[name]
+                for name in self.validation_sensor_pins:
+                    self._validation_sensor_states[name] = current_states[name]
+
+            validation_fields = []
+            for name in self.validation_sensor_pins:
+                validation_fields.append(f"{name}={int(current_states[name])}")
+            for name in self.validation_sensor_pins:
+                validation_fields.append(f"{name}_RAW={raw_states[name]}")
+            validation_suffix = "," + ",".join(validation_fields) if validation_fields else ""
             return (
                 f"GPIO_INPUTS:START={int(current_states['START'])},"
                 f"STOP={int(current_states['STOP'])},"
@@ -593,6 +657,48 @@ class PiGpioManager:
                 f"HOME_RAW={raw_states['HOME']},"
                 f"M0_HOME_RAW={raw_states['M0_HOME']},"
                 f"M1_HOME_RAW={raw_states['M1_HOME']}"
+                f"{validation_suffix}"
+            )
+
+    def validation_input_summary(self) -> str:
+        with self._lock:
+            if not self.validation_sensor_pins:
+                return (
+                    "GPIO_VALIDATION_INPUTS:ENABLED=0,"
+                    "ROLL_PROX=0,TILT_PROX=0,"
+                    "ROLL_PROX_RAW=NA,TILT_PROX_RAW=NA,"
+                    "ERROR=none"
+                )
+
+            try:
+                raw_states = self._read_input_raws()
+            except Exception as exc:
+                self.backend_error = str(exc)
+                raw_states = {name: "NA" for name in self.validation_sensor_pins}
+                current_states = dict(self._validation_sensor_states)
+                error = str(exc).replace(",", ";")
+            else:
+                current_states = {
+                    name: self._decode_named_input(name, raw_states[name])
+                    for name in self.validation_sensor_pins
+                }
+                for name in self.validation_sensor_pins:
+                    self._validation_sensor_states[name] = current_states[name]
+                error = "none"
+
+            return (
+                f"GPIO_VALIDATION_INPUTS:ENABLED=1,"
+                f"ROLL_PROX={int(current_states.get('ROLL_PROX', False))},"
+                f"TILT_PROX={int(current_states.get('TILT_PROX', False))},"
+                f"ROLL_PROX_RAW={raw_states.get('ROLL_PROX', 'NA')},"
+                f"TILT_PROX_RAW={raw_states.get('TILT_PROX', 'NA')},"
+                f"ROLL_PROX_PIN={self.validation_sensor_pins.get('ROLL_PROX', 'NA')},"
+                f"ROLL_PROX_PHYSICAL_PIN={self._physical_pin(self.validation_sensor_pins.get('ROLL_PROX'))},"
+                f"TILT_PROX_PIN={self.validation_sensor_pins.get('TILT_PROX', 'NA')},"
+                f"TILT_PROX_PHYSICAL_PIN={self._physical_pin(self.validation_sensor_pins.get('TILT_PROX'))},"
+                f"ACTIVE_HIGH={int(self.validation_sensor_active_high)},"
+                f"PULL_UP={int(self.validation_sensor_pull_up)},"
+                f"ERROR={error}"
             )
 
     def config_summary(self) -> str:
@@ -615,6 +721,9 @@ class PiGpioManager:
             f"HOME_SWITCH_NC={int(self.home_switches_normally_closed)},"
             f"HOME_SWITCH_ACTIVE_HIGH={int(self.home_switches_active_high)},"
             f"HOME_SWITCH_PULL_UP={int(self.home_switch_pull_up)},"
+            f"VALIDATION_SENSORS_ENABLED={int(self.validation_sensors_enabled)},"
+            f"VALIDATION_SENSOR_ACTIVE_HIGH={int(self.validation_sensor_active_high)},"
+            f"VALIDATION_SENSOR_PULL_UP={int(self.validation_sensor_pull_up)},"
             f"LED_ACTIVE_HIGH={int(self.default_led_active_high)},"
             f"READY_LED_ACTIVE_HIGH={int(self.led_active_high['READY'])},"
             f"RUNNING_LED_ACTIVE_HIGH={int(self.led_active_high['RUNNING'])},"
@@ -624,6 +733,10 @@ class PiGpioManager:
             f"HOME_PIN={self.button_pins['HOME']},"
             f"M0_HOME_PIN={self.home_switch_pins['M0_HOME']},"
             f"M1_HOME_PIN={self.home_switch_pins['M1_HOME']},"
+            f"ROLL_PROX_PIN={self.validation_sensor_pins.get('ROLL_PROX', 'NA')},"
+            f"ROLL_PROX_PHYSICAL_PIN={self._physical_pin(self.validation_sensor_pins.get('ROLL_PROX'))},"
+            f"TILT_PROX_PIN={self.validation_sensor_pins.get('TILT_PROX', 'NA')},"
+            f"TILT_PROX_PHYSICAL_PIN={self._physical_pin(self.validation_sensor_pins.get('TILT_PROX'))},"
             f"READY_LED_PIN={self.led_pins['READY']},"
             f"READY_LED_PHYSICAL_PIN={self._physical_pin(self.led_pins['READY'])},"
             f"RUNNING_LED_PIN={self.led_pins['RUNNING']},"

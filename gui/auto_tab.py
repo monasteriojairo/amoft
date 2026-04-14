@@ -38,6 +38,10 @@ class AutoTab(QWidget):
         self.pending_delay_ms = 0
         self.delay_started_at = 0.0
         self.executing_command = None
+        self.external_lock_active = False
+        self.external_lock_reason = ""
+        self.external_run_active = False
+        self.external_run_label = ""
         self.delay_timer = QTimer(self)
         self.delay_timer.setSingleShot(True)
         self.delay_timer.timeout.connect(self.advance_sequence)
@@ -406,6 +410,9 @@ class AutoTab(QWidget):
         return normalized
 
     def start_cycle(self):
+        if self.external_lock_active:
+            self.log_signal.emit("Auto: Start ignored because controls are locked by external mode")
+            return
         if self.is_running:
             self.log_signal.emit("Auto: Queue already running")
             return
@@ -418,6 +425,8 @@ class AutoTab(QWidget):
         self.is_running = True
         self.is_paused = False
         self.pending_delay_ms = 0
+        self.external_run_active = False
+        self.external_run_label = ""
         self.progress.setValue(0)
         self.step_label.setText("Current Step: STARTING")
         self.log_signal.emit(f"Auto: Starting queued sequence with {len(self.execution_steps)} step(s)")
@@ -427,6 +436,9 @@ class AutoTab(QWidget):
 
     def start_from_hardware(self):
         self.log_signal.emit("Auto: Hardware START received")
+        if self.external_lock_active:
+            self.log_signal.emit("Auto: Hardware START ignored because controls are locked by external mode")
+            return False
         if not self.sequence_steps:
             self.log_signal.emit("Auto: Hardware START ignored because no queue is loaded")
             self.cycle_state_signal.emit("idle")
@@ -437,12 +449,51 @@ class AutoTab(QWidget):
         self.start_cycle()
         return True
 
-    def expand_steps_for_run(self):
+    def expand_steps_for_run(self, steps=None):
         execution = []
-        for step in self.sequence_steps:
+        for step in steps if steps is not None else self.sequence_steps:
             for repeat_index in range(step["repeat"]):
                 execution.extend(self.execution_entries_for_step(step, repeat_index + 1))
         return execution
+
+    def set_external_lock(self, locked: bool, reason: str = ""):
+        self.external_lock_active = locked
+        self.external_lock_reason = reason
+        self.update_button_states()
+        if locked:
+            suffix = f" ({reason})" if reason else ""
+            self.log_signal.emit(f"Auto: Controls locked by external mode{suffix}")
+        else:
+            self.log_signal.emit("Auto: Controls unlocked")
+
+    def start_external_sequence(self, steps, label: str = "External"):
+        if self.is_running:
+            self.log_signal.emit(f"Auto: {label} start ignored because queue is already running")
+            return False
+        if not steps:
+            self.log_signal.emit(f"Auto: {label} start ignored because no steps were provided")
+            return False
+
+        self.execution_steps = self.expand_steps_for_run(steps)
+        if not self.execution_steps:
+            self.log_signal.emit(f"Auto: {label} start ignored because no commands were generated")
+            return False
+
+        self.current_step_index = -1
+        self.is_running = True
+        self.is_paused = False
+        self.pending_delay_ms = 0
+        self.external_run_active = True
+        self.external_run_label = label
+        self.progress.setValue(0)
+        self.step_label.setText(f"Current Step: {label.upper()} STARTING")
+        self.log_signal.emit(
+            f"Auto: Starting {label} sequence with {len(self.execution_steps)} command step(s)"
+        )
+        self.cycle_state_signal.emit("running")
+        self.update_button_states()
+        self.advance_sequence()
+        return True
 
     def execution_entries_for_step(self, step, repeat_index):
         entries = []
@@ -542,6 +593,8 @@ class AutoTab(QWidget):
         self.is_running = False
         self.is_paused = False
         self.pending_delay_ms = 0
+        self.external_run_active = False
+        self.external_run_label = ""
         self.step_label.setText("Current Step: ABORTED")
         self.progress.setValue(0)
         self.log_signal.emit(f"Auto: Aborted after command failed -> {command}: {detail}")
@@ -602,6 +655,8 @@ class AutoTab(QWidget):
         self.is_running = False
         self.is_paused = False
         self.pending_delay_ms = 0
+        self.external_run_active = False
+        self.external_run_label = ""
         self.step_label.setText("Current Step: ABORTED")
         self.progress.setValue(0)
         self.log_signal.emit("Auto: Abort pressed")
@@ -625,6 +680,8 @@ class AutoTab(QWidget):
         self.is_paused = False
         self.pending_delay_ms = 0
         self.current_step_index = -1
+        self.external_run_active = False
+        self.external_run_label = ""
         self.step_label.setText("Current Step: IDLE")
         self.progress.setValue(0)
         self.log_signal.emit("Auto: Reset pressed")
@@ -636,22 +693,27 @@ class AutoTab(QWidget):
         self.is_running = False
         self.is_paused = False
         self.pending_delay_ms = 0
+        label = self.external_run_label
+        self.external_run_active = False
+        self.external_run_label = ""
         self.step_label.setText("Current Step: COMPLETE")
         self.progress.setValue(100)
-        self.log_signal.emit(message)
+        self.log_signal.emit(f"{label}: Sequence complete" if label else message)
         self.cycle_state_signal.emit("idle")
         self.update_button_states()
 
     def update_button_states(self):
         selected = self.sequence_list.currentRow() >= 0
-        self.start_btn.setEnabled(not self.is_running and bool(self.sequence_steps))
-        self.pause_btn.setEnabled(self.is_running and not self.is_paused)
-        self.resume_btn.setEnabled(self.is_running and self.is_paused)
-        self.abort_btn.setEnabled(self.is_running)
-        self.reset_btn.setEnabled(not self.is_running or self.is_paused)
-        self.move_up_btn.setEnabled(not self.is_running and selected)
-        self.move_down_btn.setEnabled(not self.is_running and selected)
-        self.remove_btn.setEnabled(not self.is_running and selected)
-        self.clear_btn.setEnabled(not self.is_running and bool(self.sequence_steps))
-        self.add_step_btn.setEnabled(not self.is_running)
-        self.update_step_btn.setEnabled(not self.is_running and selected)
+        locked = self.external_lock_active
+        auto_controls_enabled = not locked
+        self.start_btn.setEnabled(auto_controls_enabled and not self.is_running and bool(self.sequence_steps))
+        self.pause_btn.setEnabled(auto_controls_enabled and self.is_running and not self.is_paused)
+        self.resume_btn.setEnabled(auto_controls_enabled and self.is_running and self.is_paused)
+        self.abort_btn.setEnabled(auto_controls_enabled and self.is_running)
+        self.reset_btn.setEnabled(auto_controls_enabled and (not self.is_running or self.is_paused))
+        self.move_up_btn.setEnabled(auto_controls_enabled and not self.is_running and selected)
+        self.move_down_btn.setEnabled(auto_controls_enabled and not self.is_running and selected)
+        self.remove_btn.setEnabled(auto_controls_enabled and not self.is_running and selected)
+        self.clear_btn.setEnabled(auto_controls_enabled and not self.is_running and bool(self.sequence_steps))
+        self.add_step_btn.setEnabled(auto_controls_enabled and not self.is_running)
+        self.update_step_btn.setEnabled(auto_controls_enabled and not self.is_running and selected)

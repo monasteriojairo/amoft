@@ -1112,6 +1112,15 @@ class ManualTab(QWidget):
 
         return self.parse_csv_response(response, "GPIO_INPUTS:")
 
+    def read_validation_sensor_inputs(self):
+        if self.mode_combo.currentData() == "pi":
+            if not self.pi_connected:
+                return "ERR VALIDATION_SENSORS Pi Bridge is not connected"
+            return self.pi_client.send("GPIO_VALIDATION_INPUTS")
+        if self.local_gpio.available:
+            return self.local_gpio.validation_input_summary()
+        return "ERR VALIDATION_SENSORS local GPIO is not available"
+
     def home_input_active(self, inputs, motor_name: str):
         raw_key = f"{motor_name}_HOME_RAW"
         effective_key = f"{motor_name}_HOME"
