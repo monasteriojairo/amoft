@@ -19,7 +19,10 @@
         "home_switches_normally_closed": true,
         "home_switches_active_high": true,
         "home_switch_pull_up": true,
-        "leds_active_high": true
+        "leds_active_high": true,
+        "ready_led_active_high": true,
+        "running_led_active_high": true,
+        "fault_led_active_high": true
     },
     "auto_sequences": {
         "Demo Cycle": [

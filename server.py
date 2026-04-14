@@ -94,6 +94,9 @@ def handle_gpio_command(cmd: str):
     if cmd == "GPIO_OUTPUTS":
         return gpio.output_summary()
 
+    if cmd == "GPIO_TEST_LEDS":
+        return gpio.test_leds()
+
     if cmd.startswith("GPIO_SET_LEDS:"):
         payload = cmd.split(":", 1)[1]
         parts = [part.strip() for part in payload.split(",")]
@@ -105,6 +108,31 @@ def handle_gpio_command(cmd: str):
         fault = parts[2] == "1"
         gpio.set_leds(ready, running, fault)
         return "OK GPIO_SET_LEDS"
+
+    if cmd.startswith("GPIO_SET_LED_LEVELS:"):
+        payload = cmd.split(":", 1)[1]
+        parts = [part.strip() for part in payload.split(",")]
+        if len(parts) != 3:
+            return "ERR GPIO_SET_LED_LEVELS"
+
+        ready_high = parts[0] == "1"
+        running_high = parts[1] == "1"
+        fault_high = parts[2] == "1"
+        gpio.set_led_levels(ready_high, running_high, fault_high)
+        return "OK GPIO_SET_LED_LEVELS"
+
+    if cmd.startswith("GPIO_SET_PIN_LEVEL:"):
+        payload = cmd.split(":", 1)[1]
+        parts = [part.strip() for part in payload.split(",")]
+        if len(parts) != 2:
+            return "ERR GPIO_SET_PIN_LEVEL"
+
+        try:
+            pin = int(parts[0])
+            high = parts[1] == "1"
+            return gpio.set_gpio_level(pin, high)
+        except Exception as exc:
+            return f"ERR GPIO_SET_PIN_LEVEL {str(exc).replace(',', ';')}"
 
     return None
 

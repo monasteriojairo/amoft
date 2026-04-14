@@ -26,6 +26,9 @@ DEFAULT_CONFIG = {
         "home_switches_active_high": True,
         "home_switch_pull_up": True,
         "leds_active_high": True,
+        "ready_led_active_high": True,
+        "running_led_active_high": True,
+        "fault_led_active_high": True,
     },
 }
 

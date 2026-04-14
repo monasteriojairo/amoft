@@ -11,7 +11,7 @@ from controllers.arduino_controller import ArduinoController
 from controllers.clearcore_controller import ClearCoreController
 from controllers.pi_client import PiClient
 from utils.config_manager import load_config
-from utils.pi_gpio import PiGpioManager
+from utils.pi_gpio import BCM_TO_PHYSICAL_PIN, PiGpioManager
 from utils.serial_ports import PROBE_BAUDRATES, get_serial_ports
 
 
@@ -57,8 +57,16 @@ class ManualTab(QWidget):
         self.machine_inputs_label = None
         self.estop_override_checkbox = None
         self.limit_override_checkbox = None
+        self.led_override_checkbox = None
+        self.led_raw_override_checkbox = None
+        self.led_override_checks = {}
+        self.gpio_probe_pin_combo = None
+        self.gpio_probe_widgets = []
         self.estop_override_active = False
         self.limit_override_active = False
+        self.led_override_active = False
+        self.led_raw_override_active = False
+        self.led_override_states = {"READY": True, "RUNNING": False, "FAULT": False}
         self.last_motor_status = {"M0": "off", "M1": "off"}
         self.machine_state = "idle"
         self.system_homed = False
@@ -85,8 +93,14 @@ class ManualTab(QWidget):
         self.homing_dialog_label = None
         self.homing_dialog_phase = 0
         self.last_led_state = None
+        self.last_led_error = None
         self.last_gpio_inputs_response = None
         self.gpio_pin_map = {"M0_HOME": "23", "M1_HOME": "24"}
+        self.led_pin_map = {
+            "READY": {"label": "Green", "gpio": "5", "physical": "29"},
+            "RUNNING": {"label": "Blue", "gpio": "6", "physical": "31"},
+            "FAULT": {"label": "Red", "gpio": "13", "physical": "33"},
+        }
         self.last_home_switch_snapshot = {
             "M0_HOME": {"state": None, "raw": None},
             "M1_HOME": {"state": None, "raw": None},
@@ -360,10 +374,24 @@ class ManualTab(QWidget):
             if pin_key in config:
                 self.gpio_pin_map[key] = config[pin_key]
 
+        for key in ("READY", "RUNNING", "FAULT"):
+            pin_key = f"{key}_LED_PIN"
+            physical_key = f"{key}_LED_PHYSICAL_PIN"
+            if pin_key in config:
+                self.led_pin_map[key]["gpio"] = config[pin_key]
+            if physical_key in config:
+                self.led_pin_map[key]["physical"] = config[physical_key]
+
         m0_pin = self.gpio_pin_map.get("M0_HOME", "?")
         m1_pin = self.gpio_pin_map.get("M1_HOME", "?")
         self.log_signal.emit(
             f"Pi home switch mapping -> M0_HOME=GPIO{m0_pin}, M1_HOME=GPIO{m1_pin}"
+        )
+        self.log_signal.emit(
+            "Pi LED mapping -> "
+            f"Green=GPIO{self.led_pin_map['READY']['gpio']} physical {self.led_pin_map['READY']['physical']}, "
+            f"Blue=GPIO{self.led_pin_map['RUNNING']['gpio']} physical {self.led_pin_map['RUNNING']['physical']}, "
+            f"Red=GPIO{self.led_pin_map['FAULT']['gpio']} physical {self.led_pin_map['FAULT']['physical']}"
         )
         if m0_pin == m1_pin:
             self.log_signal.emit(
@@ -828,36 +856,131 @@ class ManualTab(QWidget):
                 self.set_machine_state("faulted")
 
     def update_clearcore_leds(self):
-        homing_active = self.home_sequence_active or self.machine_state == "homing"
-        motion_active = self.motor_motion_active() or self.actuator_motion_active
-        homing_flash_on = homing_active and int(time.monotonic() * 2) % 2 == 0
-        running_active = self.auto_cycle_running or motion_active
-        fault_active = self.machine_state in {"faulted", "estop_active"}
+        if self.led_override_active:
+            if self.led_raw_override_active:
+                self.update_raw_led_levels()
+                return
 
-        ready = int(
-            self.machine_state == "ready"
-            and not running_active
-            and not homing_active
-            and not fault_active
-        )
-        running = int(not fault_active and (homing_flash_on or (running_active and not homing_active)))
-        fault = int(fault_active)
-        led_state = (ready, running, fault)
+            ready = int(self.led_override_states["READY"])
+            running = int(self.led_override_states["RUNNING"])
+            fault = int(self.led_override_states["FAULT"])
+        else:
+            fault_active = (
+                self.system_faulted
+                or self.estop_active
+                or self.machine_state in {"faulted", "estop_active"}
+            )
+
+            homing_active = self.home_sequence_active or self.machine_state == "homing"
+            homing_flash_on = homing_active and int(time.monotonic() * 2) % 2 == 0
+            motion_active = self.motor_motion_active() or self.actuator_motion_active
+
+            ready = 1
+            running = int(
+                not fault_active
+                and (
+                    homing_flash_on
+                    or (not homing_active and (self.auto_cycle_running or motion_active))
+                )
+            )
+            fault = int(fault_active)
+        led_state = ("logical", ready, running, fault)
         if led_state == self.last_led_state:
             return
 
         try:
+            output_summary = None
             if self.mode_combo.currentData() == "pi":
                 if not self.pi_connected:
                     return
-                self.pi_client.send(f"GPIO_SET_LEDS:{ready},{running},{fault}")
+                response = self.pi_client.send(f"GPIO_SET_LEDS:{ready},{running},{fault}")
+                if self.response_has_error(response):
+                    raise RuntimeError(response)
+                output_summary = self.pi_client.send("GPIO_OUTPUTS")
             elif self.local_gpio.available:
                 self.local_gpio.set_leds(bool(ready), bool(running), bool(fault))
+                output_summary = self.local_gpio.output_summary()
             else:
                 return
             self.last_led_state = led_state
+            self.last_led_error = None
+            if output_summary:
+                self.log_signal.emit(f"LED outputs -> {output_summary}")
         except Exception as e:
-            self.log_signal.emit(f"LED update failed: {e}")
+            error = str(e)
+            if error != self.last_led_error:
+                self.log_signal.emit(f"LED update failed: {error}")
+            self.last_led_error = error
+
+    def update_raw_led_levels(self):
+        ready = int(self.led_override_states["READY"])
+        running = int(self.led_override_states["RUNNING"])
+        fault = int(self.led_override_states["FAULT"])
+        led_state = ("raw", ready, running, fault)
+        if led_state == self.last_led_state:
+            return
+
+        try:
+            output_summary = None
+            if self.mode_combo.currentData() == "pi":
+                if not self.pi_connected:
+                    return
+                response = self.pi_client.send(f"GPIO_SET_LED_LEVELS:{ready},{running},{fault}")
+                if self.response_has_error(response):
+                    raise RuntimeError(response)
+                output_summary = self.pi_client.send("GPIO_OUTPUTS")
+            elif self.local_gpio.available:
+                self.local_gpio.set_led_levels(bool(ready), bool(running), bool(fault))
+                output_summary = self.local_gpio.output_summary()
+            else:
+                return
+            self.last_led_state = led_state
+            self.last_led_error = None
+            if output_summary:
+                self.log_signal.emit(f"Raw LED levels -> {output_summary}")
+        except Exception as e:
+            error = str(e)
+            if error != self.last_led_error:
+                self.log_signal.emit(f"Raw LED level update failed: {error}")
+            self.last_led_error = error
+
+    def on_led_override_toggled(self, enabled: bool):
+        self.led_override_active = enabled
+        if self.led_raw_override_checkbox is not None:
+            self.led_raw_override_checkbox.setEnabled(enabled)
+        for checkbox in self.led_override_checks.values():
+            checkbox.setEnabled(enabled)
+        self.last_led_state = None
+        self.update_clearcore_leds()
+        state = "enabled" if enabled else "disabled"
+        self.log_signal.emit(f"Manual LED override {state}")
+
+    def on_led_raw_override_toggled(self, enabled: bool):
+        self.led_raw_override_active = enabled
+        self.last_led_state = None
+        self.update_clearcore_leds()
+        mode = "raw GPIO levels" if enabled else "configured LED polarity"
+        self.log_signal.emit(f"Manual LED override mode -> {mode}")
+
+    def on_manual_led_toggled(self, name: str, enabled: bool):
+        self.led_override_states[name] = enabled
+        if not self.led_override_active:
+            return
+        self.last_led_state = None
+        self.update_clearcore_leds()
+        info = self.led_pin_map.get(name, {"label": name, "gpio": "?", "physical": "?"})
+        if self.led_raw_override_active:
+            state = "HIGH" if enabled else "LOW"
+            self.log_signal.emit(
+                f"Manual LED raw -> {info['label']} GPIO{info['gpio']} "
+                f"physical {info['physical']} set {state}"
+            )
+        else:
+            state = "ON" if enabled else "OFF"
+            self.log_signal.emit(
+                f"Manual LED logical -> {info['label']} GPIO{info['gpio']} "
+                f"physical {info['physical']} set {state}"
+            )
 
     def handle_clearcore_event(self, event_name: str):
         normalized = event_name.upper()
@@ -894,7 +1017,7 @@ class ManualTab(QWidget):
         self.set_machine_state("running")
         self.hardware_start_requested.emit()
 
-    def abort_motion_for_safety(self, reason: str, machine_state: str):
+    def abort_motion_for_safety(self, reason: str, machine_state: str, latch_fault: bool = True):
         self.log_signal.emit(f"{reason}: aborting auto queue and stopping all motion")
         self.hardware_stop_requested.emit()
 
@@ -908,8 +1031,9 @@ class ManualTab(QWidget):
 
         self.motor_motion_direction = {"M0": "STOP", "M1": "STOP"}
         self.actuator_motion_active = False
-        self.system_faulted = True
-        self.safety_stop_latched = True
+        if latch_fault:
+            self.system_faulted = True
+            self.safety_stop_latched = True
 
         for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
             self.send_machine_best_effort(command)
@@ -923,9 +1047,18 @@ class ManualTab(QWidget):
         self.log_clearcore_diagnostics()
 
     def handle_hardware_stop(self):
+        if self.estop_active:
+            self.abort_motion_for_safety(
+                "Hardware STOP safety stop",
+                "estop_active",
+                latch_fault=True,
+            )
+            return
+
         self.abort_motion_for_safety(
             "Hardware STOP safety stop",
-            "estop_active" if self.estop_active else "faulted",
+            "ready" if self.system_homed else "idle",
+            latch_fault=False,
         )
 
     def handle_hardware_home(self):
@@ -1670,6 +1803,15 @@ class ManualTab(QWidget):
             self.estop_override_checkbox.setEnabled(clearpath_enabled)
         if self.limit_override_checkbox is not None:
             self.limit_override_checkbox.setEnabled(clearpath_enabled)
+        gpio_enabled = self.pi_connected if self.mode_combo.currentData() == "pi" else self.local_gpio.available
+        if self.led_override_checkbox is not None:
+            self.led_override_checkbox.setEnabled(gpio_enabled)
+        if self.led_raw_override_checkbox is not None:
+            self.led_raw_override_checkbox.setEnabled(gpio_enabled and self.led_override_active)
+        for checkbox in self.led_override_checks.values():
+            checkbox.setEnabled(gpio_enabled and self.led_override_active)
+        for widget in self.gpio_probe_widgets:
+            widget.setEnabled(gpio_enabled)
 
     def update_connection_label(self):
         mode = self.mode_combo.currentData()
@@ -1981,7 +2123,7 @@ class ManualTab(QWidget):
                 self.log_signal.emit("GPIO check skipped: Pi Bridge is not connected")
                 return
 
-            for command in ("GPIO_CONFIG", "GPIO_INPUTS"):
+            for command in ("GPIO_CONFIG", "GPIO_INPUTS", "GPIO_OUTPUTS"):
                 try:
                     response = self.pi_client.send(command)
                     self.log_signal.emit(f"GPIO check {command} -> {response}")
@@ -1997,12 +2139,72 @@ class ManualTab(QWidget):
 
         gpio_config = self.local_gpio.config_summary()
         gpio_inputs = self.local_gpio.input_summary()
+        gpio_outputs = self.local_gpio.output_summary()
         self.log_signal.emit(f"GPIO check GPIO_CONFIG -> {gpio_config}")
         self.cache_gpio_config(gpio_config)
         self.log_signal.emit(f"GPIO check GPIO_INPUTS -> {gpio_inputs}")
         self.log_home_switch_transitions(
             self.parse_csv_response(gpio_inputs, "GPIO_INPUTS:")
         )
+        self.log_signal.emit(f"GPIO check GPIO_OUTPUTS -> {gpio_outputs}")
+
+    def test_gpio_leds(self):
+        self.log_signal.emit(
+            "LED test: watching outputs in order: green, blue, red, then restore"
+        )
+        mode = self.mode_combo.currentData()
+        if mode == "pi":
+            if not self.pi_connected:
+                self.log_signal.emit("LED test skipped: Pi Bridge is not connected")
+                return
+            try:
+                response = self.pi_client.send("GPIO_TEST_LEDS")
+                self.log_signal.emit(f"LED test -> {response}")
+            except Exception as e:
+                self.log_signal.emit(f"LED test failed: {e}")
+            return
+
+        if not self.local_gpio.available:
+            self.log_signal.emit("LED test skipped: local GPIO is not available")
+            return
+
+        try:
+            response = self.local_gpio.test_leds()
+            self.log_signal.emit(f"LED test -> {response}")
+        except Exception as e:
+            self.log_signal.emit(f"LED test failed: {e}")
+
+    def set_gpio_probe_level(self, high: bool):
+        if self.gpio_probe_pin_combo is None:
+            return
+
+        pin = self.gpio_probe_pin_combo.currentData()
+        physical_pin = BCM_TO_PHYSICAL_PIN.get(pin, "unknown")
+        level_name = "HIGH" if high else "LOW"
+        self.log_signal.emit(
+            f"GPIO probe: setting BCM GPIO{pin} physical {physical_pin} {level_name}"
+        )
+
+        mode = self.mode_combo.currentData()
+        try:
+            if mode == "pi":
+                if not self.pi_connected:
+                    self.log_signal.emit("GPIO probe skipped: Pi Bridge is not connected")
+                    return
+                response = self.pi_client.send(
+                    f"GPIO_SET_PIN_LEVEL:{pin},{1 if high else 0}"
+                )
+                if self.response_has_error(response):
+                    raise RuntimeError(response)
+            else:
+                if not self.local_gpio.available:
+                    self.log_signal.emit("GPIO probe skipped: local GPIO is not available")
+                    return
+                response = self.local_gpio.set_gpio_level(pin, high)
+
+            self.log_signal.emit(f"GPIO probe -> {response}")
+        except Exception as e:
+            self.log_signal.emit(f"GPIO probe failed: {e}")
 
     def create_connection_group(self):
         box = QGroupBox("Connection / Ports")
@@ -2028,6 +2230,39 @@ class ManualTab(QWidget):
         refresh_btn = QPushButton("Refresh Ports")
         set_port_btn = QPushButton("Use Selected Port")
         gpio_check_btn = QPushButton("Check GPIO Buttons")
+        led_test_btn = QPushButton("Test LEDs")
+        self.gpio_probe_pin_combo = QComboBox()
+        for pin in sorted(BCM_TO_PHYSICAL_PIN):
+            self.gpio_probe_pin_combo.addItem(
+                f"GPIO{pin} / physical {BCM_TO_PHYSICAL_PIN[pin]}",
+                pin,
+            )
+        default_probe_index = self.gpio_probe_pin_combo.findData(6)
+        if default_probe_index >= 0:
+            self.gpio_probe_pin_combo.setCurrentIndex(default_probe_index)
+        gpio_probe_high_btn = QPushButton("Probe HIGH")
+        gpio_probe_low_btn = QPushButton("Probe LOW")
+        probe_tooltip = (
+            "Diagnostic only: drives the selected BCM GPIO pin directly. "
+            "Use a meter on the listed physical header pin."
+        )
+        self.gpio_probe_pin_combo.setToolTip(probe_tooltip)
+        gpio_probe_high_btn.setToolTip(probe_tooltip)
+        gpio_probe_low_btn.setToolTip(probe_tooltip)
+        self.led_override_checkbox = QCheckBox("Manual LED override")
+        self.led_raw_override_checkbox = QCheckBox("Raw GPIO levels")
+        self.led_raw_override_checkbox.setToolTip(
+            "When checked, Green/Blue/Red checkboxes drive the Pi GPIO pins HIGH/LOW directly."
+        )
+        self.led_override_checks = {
+            "READY": QCheckBox("Green / GPIO5"),
+            "RUNNING": QCheckBox("Blue / GPIO6"),
+            "FAULT": QCheckBox("Red / GPIO13"),
+        }
+        for name, checkbox in self.led_override_checks.items():
+            checkbox.setChecked(self.led_override_states[name])
+            checkbox.setEnabled(False)
+        self.led_raw_override_checkbox.setEnabled(False)
 
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.connect_btn.clicked.connect(self.connect_selected_mode)
@@ -2035,8 +2270,27 @@ class ManualTab(QWidget):
         refresh_btn.clicked.connect(self.refresh_ports)
         set_port_btn.clicked.connect(self.set_clearcore_port)
         gpio_check_btn.clicked.connect(self.check_gpio_buttons)
+        led_test_btn.clicked.connect(self.test_gpio_leds)
+        gpio_probe_high_btn.clicked.connect(lambda: self.set_gpio_probe_level(True))
+        gpio_probe_low_btn.clicked.connect(lambda: self.set_gpio_probe_level(False))
+        self.led_override_checkbox.toggled.connect(self.on_led_override_toggled)
+        self.led_raw_override_checkbox.toggled.connect(self.on_led_raw_override_toggled)
+        self.led_override_checks["READY"].toggled.connect(
+            lambda checked: self.on_manual_led_toggled("READY", checked)
+        )
+        self.led_override_checks["RUNNING"].toggled.connect(
+            lambda checked: self.on_manual_led_toggled("RUNNING", checked)
+        )
+        self.led_override_checks["FAULT"].toggled.connect(
+            lambda checked: self.on_manual_led_toggled("FAULT", checked)
+        )
         self.estop_override_checkbox.toggled.connect(self.on_estop_override_toggled)
         self.limit_override_checkbox.toggled.connect(self.on_limit_override_toggled)
+        self.gpio_probe_widgets = [
+            self.gpio_probe_pin_combo,
+            gpio_probe_high_btn,
+            gpio_probe_low_btn,
+        ]
 
         grid.addWidget(QLabel("Connection Mode:"), 0, 0)
         grid.addWidget(self.mode_combo, 0, 1, 1, 2)
@@ -2047,11 +2301,21 @@ class ManualTab(QWidget):
         grid.addWidget(self.machine_inputs_label, 4, 0, 1, 3)
         grid.addWidget(self.estop_override_checkbox, 5, 0, 1, 3)
         grid.addWidget(self.limit_override_checkbox, 6, 0, 1, 3)
-        grid.addWidget(gpio_check_btn, 7, 0, 1, 3)
-        grid.addWidget(QLabel("Detected Ports:"), 8, 0)
-        grid.addWidget(self.port_combo, 8, 1, 1, 2)
-        grid.addWidget(refresh_btn, 9, 0)
-        grid.addWidget(set_port_btn, 9, 1)
+        grid.addWidget(gpio_check_btn, 7, 0, 1, 2)
+        grid.addWidget(led_test_btn, 7, 2)
+        grid.addWidget(self.led_override_checkbox, 8, 0, 1, 2)
+        grid.addWidget(self.led_raw_override_checkbox, 8, 2)
+        grid.addWidget(self.led_override_checks["READY"], 9, 0)
+        grid.addWidget(self.led_override_checks["RUNNING"], 9, 1)
+        grid.addWidget(self.led_override_checks["FAULT"], 9, 2)
+        grid.addWidget(QLabel("Raw GPIO Probe:"), 10, 0)
+        grid.addWidget(self.gpio_probe_pin_combo, 10, 1, 1, 2)
+        grid.addWidget(gpio_probe_high_btn, 11, 1)
+        grid.addWidget(gpio_probe_low_btn, 11, 2)
+        grid.addWidget(QLabel("Detected Ports:"), 12, 0)
+        grid.addWidget(self.port_combo, 12, 1, 1, 2)
+        grid.addWidget(refresh_btn, 13, 0)
+        grid.addWidget(set_port_btn, 13, 1)
 
         return box
 
