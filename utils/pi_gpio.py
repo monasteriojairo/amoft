@@ -437,6 +437,8 @@ class PiGpioManager:
         errors = []
         for name, pin in self.led_pins.items():
             desired_high = self._led_states[name] == self.led_active_high[name]
+            if self._led_output_states.get(name) == desired_high:
+                continue
             try:
                 self._set_pin_pinctrl(pin, desired_high, name)
                 self._led_output_states[name] = desired_high
@@ -453,6 +455,8 @@ class PiGpioManager:
     def _set_led_levels_pinctrl(self, levels):
         errors = []
         for name, pin in self.led_pins.items():
+            if self._led_output_states.get(name) == levels[name]:
+                continue
             try:
                 self._set_pin_pinctrl(pin, levels[name], name)
                 self._led_output_states[name] = levels[name]
