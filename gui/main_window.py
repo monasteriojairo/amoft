@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self.validation_tab.start_sequence_signal.connect(self.start_validation_sequence)
         self.validation_tab.abort_signal.connect(self.auto_tab.abort_from_hardware)
         self.validation_tab.sensor_poll_signal.connect(self.update_validation_sensors)
+        self.validation_tab.sensor_config_signal.connect(self.configure_validation_sensors)
         self.settings_tab.log_signal.connect(self.diagnostics_tab.append_log)
         self.manual_tab.pi_connection_signal.connect(self.update_pi_status)
         self.manual_tab.clearcore_connection_signal.connect(self.update_clearcore_status)
@@ -73,6 +74,7 @@ class MainWindow(QMainWindow):
         self.manual_tab.m1_status_signal.connect(self.update_m1_status)
         self.manual_tab.hardware_start_requested.connect(self.auto_tab.start_from_hardware)
         self.manual_tab.hardware_stop_requested.connect(self.auto_tab.abort_from_hardware)
+        self.manual_tab.home_switch_stop_signal.connect(self.auto_tab.handle_home_switch_stop)
 
     def set_validation_mode(self, enabled: bool):
         self.auto_tab.set_external_lock(enabled, "Validation mode" if enabled else "")
@@ -82,8 +84,15 @@ class MainWindow(QMainWindow):
         self.validation_tab.on_validation_start_result(started)
 
     def update_validation_sensors(self):
-        response = self.manual_tab.read_validation_sensor_inputs()
-        self.validation_tab.update_sensor_inputs(response)
+        digital_response = self.manual_tab.read_validation_sensor_inputs()
+        analog_response = self.manual_tab.read_analog_sensor_inputs()
+        self.validation_tab.update_sensor_inputs(digital_response)
+        self.validation_tab.update_analog_sensor_inputs(analog_response)
+        self.validation_tab.record_sensor_snapshot()
+
+    def configure_validation_sensors(self, settings: dict):
+        response = self.manual_tab.configure_validation_sensor_inputs(settings)
+        self.validation_tab.on_sensor_calibration_saved(response)
 
     def reconnect_from_auto(self):
         self.manual_tab.disconnect_all()

@@ -2,9 +2,14 @@ const int EnablePin = 8;
 const int PWMPinA = 11;
 const int PWMPinB = 3;
 const int RetractConfirmPin = 4;
+const int RollSensorPin = A0;
+const int TiltSensorPin = A1;
 
 const int forwardSpeed = 255;
 const int reverseSpeed = 255;
+const long adcReferenceMillivolts = 5000;
+const int adcMaxCount = 1023;
+const int sensorAverageSamples = 4;
 
 const unsigned long retractTime = 8000;
 const unsigned long extendTime = 8000;
@@ -38,6 +43,8 @@ void setup() {
   pinMode(PWMPinB, OUTPUT);
   analogWrite(PWMPinB, 0);
   pinMode(RetractConfirmPin, INPUT_PULLUP);
+  pinMode(RollSensorPin, INPUT);
+  pinMode(TiltSensorPin, INPUT);
 
   stopMotor();
   Serial.begin(9600);
@@ -118,6 +125,10 @@ void loop() {
       Serial.println(diagnosticSummary());
     }
 
+    else if (command == "SENSORS") {
+      Serial.println(sensorSummary());
+    }
+
     else if (command == "CLEAR_FAULT") {
       if (!retractConfirmActive()) {
         lastFault = "";
@@ -127,7 +138,7 @@ void loop() {
     }
 
     else if (command == "CAPS") {
-      Serial.println("CAPS:ACTUATOR,STATUS,LIMITS,HOME");
+      Serial.println("CAPS:ACTUATOR,STATUS,LIMITS,HOME,SENSORS");
     }
 
     else {
@@ -249,12 +260,41 @@ String limitSummary() {
 }
 
 String diagnosticSummary() {
+  int rollAdc = readAveragedAnalog(RollSensorPin);
+  int tiltAdc = readAveragedAnalog(TiltSensorPin);
   return String("DIAG:STATE=") + currentStatus() +
          ",RETRACT_RAW=" + digitalRead(RetractConfirmPin) +
          ",RETRACT_ACTIVE=" + (retractConfirmActive() ? "1" : "0") +
          ",ENABLE=" + digitalRead(EnablePin) +
          ",PWM_A=" + digitalRead(PWMPinA) +
-         ",PWM_B=" + digitalRead(PWMPinB);
+         ",PWM_B=" + digitalRead(PWMPinB) +
+         ",ROLL_ADC=" + rollAdc +
+         ",ROLL_MV=" + adcToMillivolts(rollAdc) +
+         ",TILT_ADC=" + tiltAdc +
+         ",TILT_MV=" + adcToMillivolts(tiltAdc);
+}
+
+String sensorSummary() {
+  int rollAdc = readAveragedAnalog(RollSensorPin);
+  int tiltAdc = readAveragedAnalog(TiltSensorPin);
+  return String("SENSORS:MS=") + millis() +
+         ",STATE=" + currentStatus() +
+         ",ROLL_ADC=" + rollAdc +
+         ",ROLL_MV=" + adcToMillivolts(rollAdc) +
+         ",TILT_ADC=" + tiltAdc +
+         ",TILT_MV=" + adcToMillivolts(tiltAdc);
+}
+
+int readAveragedAnalog(int pin) {
+  long total = 0;
+  for (int index = 0; index < sensorAverageSamples; ++index) {
+    total += analogRead(pin);
+  }
+  return int((total + (sensorAverageSamples / 2)) / sensorAverageSamples);
+}
+
+long adcToMillivolts(int raw) {
+  return (long(raw) * adcReferenceMillivolts + (adcMaxCount / 2)) / adcMaxCount;
 }
 
 void runForward(int speedVal) {

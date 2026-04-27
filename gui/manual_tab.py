@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 from controllers.arduino_controller import ArduinoController
 from controllers.clearcore_controller import ClearCoreController
 from controllers.pi_client import PiClient
-from utils.config_manager import load_config
+from utils.config_manager import load_config, save_config
 from utils.pi_gpio import BCM_TO_PHYSICAL_PIN, PiGpioManager
 from utils.serial_ports import PROBE_BAUDRATES, get_serial_ports
 
@@ -25,6 +25,7 @@ class ManualTab(QWidget):
     hardware_start_requested = Signal()
     hardware_stop_requested = Signal()
     command_failed_signal = Signal(str, str)
+    home_switch_stop_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1017,9 +1018,17 @@ class ManualTab(QWidget):
         self.set_machine_state("running")
         self.hardware_start_requested.emit()
 
-    def abort_motion_for_safety(self, reason: str, machine_state: str, latch_fault: bool = True):
+    def abort_motion_for_safety(
+        self,
+        reason: str,
+        machine_state: str,
+        latch_fault: bool = True,
+        disable_motors: bool | None = None,
+    ):
         self.log_signal.emit(f"{reason}: aborting auto queue and stopping all motion")
         self.hardware_stop_requested.emit()
+        if disable_motors is None:
+            disable_motors = latch_fault
 
         if self.home_sequence_active:
             self.home_timer.stop()
@@ -1035,7 +1044,12 @@ class ManualTab(QWidget):
             self.system_faulted = True
             self.safety_stop_latched = True
 
-        for command in ("STOP_M0", "DISABLE_M0", "STOP_M1", "DISABLE_M1", "STOP_ACTUATOR"):
+        commands = ["STOP_M0", "STOP_M1", "STOP_ACTUATOR"]
+        if disable_motors:
+            commands.insert(1, "DISABLE_M0")
+            commands.insert(3, "DISABLE_M1")
+
+        for command in commands:
             self.send_machine_best_effort(command)
 
         self.set_machine_state(machine_state)
@@ -1059,6 +1073,7 @@ class ManualTab(QWidget):
             "Hardware STOP safety stop",
             "ready" if self.system_homed else "idle",
             latch_fault=False,
+            disable_motors=False,
         )
 
     def handle_hardware_home(self):
@@ -1119,6 +1134,62 @@ class ManualTab(QWidget):
             return self.pi_client.send("GPIO_VALIDATION_INPUTS")
         if self.local_gpio.available:
             return self.local_gpio.validation_input_summary()
+        return "ERR VALIDATION_SENSORS local GPIO is not available"
+
+    def read_analog_sensor_inputs(self):
+        if self.mode_combo.currentData() == "pi":
+            if not self.pi_connected:
+                return "ERR SENSORS Pi Bridge is not connected"
+            try:
+                return self.pi_client.send("SENSORS")
+            except Exception as e:
+                return f"ERR SENSORS {e}"
+
+        if not self.arduino_connected or self.arduino_client is None:
+            return "ERR SENSORS Arduino is not connected"
+        try:
+            return self.arduino_client.send_command("SENSORS")
+        except Exception as e:
+            return f"ERR SENSORS {e}"
+
+    def configure_validation_sensor_inputs(self, settings):
+        enabled = bool(settings.get("enabled", True))
+        roll_pin = int(settings.get("roll_pin", 20))
+        tilt_pin = int(settings.get("tilt_pin", 21))
+        active_high = bool(settings.get("active_high", False))
+        pull_up = bool(settings.get("pull_up", True))
+
+        if roll_pin == tilt_pin:
+            return "ERR VALIDATION_SENSORS roll and tilt pins must differ"
+        if roll_pin not in BCM_TO_PHYSICAL_PIN or tilt_pin not in BCM_TO_PHYSICAL_PIN:
+            return "ERR VALIDATION_SENSORS pin is not on the known 40-pin header"
+
+        config = load_config()
+        gpio_config = config.setdefault("pi_gpio", {})
+        gpio_config["validation_sensors_enabled"] = enabled
+        gpio_config["roll_prox_pin"] = roll_pin
+        gpio_config["tilt_prox_pin"] = tilt_pin
+        gpio_config["validation_sensor_active_high"] = active_high
+        gpio_config["validation_sensor_pull_up"] = pull_up
+        save_config(config)
+
+        if self.mode_combo.currentData() == "pi":
+            if not self.pi_connected:
+                return "ERR VALIDATION_SENSORS Pi Bridge is not connected"
+            command = (
+                "GPIO_CONFIG_VALIDATION_SENSORS:"
+                f"{int(enabled)},{roll_pin},{tilt_pin},{int(active_high)},{int(pull_up)}"
+            )
+            return self.pi_client.send(command)
+
+        if self.local_gpio.available:
+            return self.local_gpio.configure_validation_sensors(
+                enabled,
+                roll_pin,
+                tilt_pin,
+                active_high,
+                pull_up,
+            )
         return "ERR VALIDATION_SENSORS local GPIO is not available"
 
     def home_input_active(self, inputs, motor_name: str):
@@ -1196,12 +1267,20 @@ class ManualTab(QWidget):
                     f"Pi software limit -> {motor_name}_HOME active; stopping {motor_name}"
                 )
                 self.send_machine_best_effort(f"STOP_{motor_name}")
+                self.home_switch_stop_signal.emit(motor_name)
 
     def move_toward_home_command(self, motor_name: str):
+        if motor_name == "M0":
+            return "MOVE_POS2_M0"
         return f"MOVE_POS2_{motor_name}"
 
     def move_away_from_home_command(self, motor_name: str):
+        if motor_name == "M0":
+            return "MOVE_POS1_M0"
         return f"MOVE_POS1_{motor_name}"
+
+    def should_release_home_switch_before_seek(self, motor_name: str):
+        return motor_name != "M0"
 
     def start_servo_home(self, motor_name: str):
         self.home_motor = motor_name
@@ -1216,7 +1295,10 @@ class ManualTab(QWidget):
             self.fail_home_sequence(self.format_estop_home_abort("before servo homing", inputs))
             return
 
-        if self.home_input_active(inputs, motor_name):
+        if (
+            self.home_input_active(inputs, motor_name)
+            and self.should_release_home_switch_before_seek(motor_name)
+        ):
             self.home_step = "servo_release"
             self.home_phase_started_at = time.monotonic()
             source = inputs.get(f"{motor_name}_HOME_SOURCE", "ClearCore")
@@ -1483,6 +1565,7 @@ class ManualTab(QWidget):
             "CYCLE",
             "DIAG",
             "DIAGNOSTICS",
+            "SENSORS",
         }
 
     def route_command(self, cmd: str):
@@ -1506,7 +1589,7 @@ class ManualTab(QWidget):
         return self.arduino_client.send_command(translated)
 
     def schedule_actuator_diagnostics(self, cmd: str):
-        if cmd in {"STATUS_ACTUATOR", "LIMITS", "DIAG", "DIAGNOSTICS"}:
+        if cmd in {"STATUS_ACTUATOR", "LIMITS", "DIAG", "DIAGNOSTICS", "SENSORS"}:
             return
         if not self.is_actuator_command(cmd):
             return
@@ -2382,8 +2465,8 @@ class ManualTab(QWidget):
 
         ping_btn = QPushButton("Ping")
         enable_btn = QPushButton("Enable")
-        pos1_btn = QPushButton("Forward")
-        pos2_btn = QPushButton("Reverse")
+        pos1_btn = QPushButton("Extend")
+        pos2_btn = QPushButton("Retract")
         stop_btn = QPushButton("Stop")
         disable_btn = QPushButton("Disable")
 
@@ -2419,8 +2502,8 @@ class ManualTab(QWidget):
 
         ping_btn = QPushButton("Ping")
         enable_btn = QPushButton("Enable")
-        pos1_btn = QPushButton("Forward")
-        pos2_btn = QPushButton("Reverse")
+        pos1_btn = QPushButton("Extend")
+        pos2_btn = QPushButton("Retract")
         stop_btn = QPushButton("Stop")
         disable_btn = QPushButton("Disable")
 

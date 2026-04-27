@@ -198,6 +198,68 @@ class PiGpioManager:
     def _physical_pin(self, bcm_pin):
         return BCM_TO_PHYSICAL_PIN.get(bcm_pin, "unknown")
 
+    def _validation_pull_mode(self):
+        if GPIO is None:
+            return None
+        return GPIO.PUD_UP if self.validation_sensor_pull_up else GPIO.PUD_DOWN
+
+    def configure_validation_sensors(
+        self,
+        enabled: bool,
+        roll_pin: int,
+        tilt_pin: int,
+        active_high: bool,
+        pull_up: bool,
+    ):
+        roll_pin = int(roll_pin)
+        tilt_pin = int(tilt_pin)
+        if roll_pin == tilt_pin:
+            raise ValueError("roll and tilt validation sensor pins must differ")
+        if roll_pin not in BCM_TO_PHYSICAL_PIN or tilt_pin not in BCM_TO_PHYSICAL_PIN:
+            raise ValueError("validation sensor pin is not on the known 40-pin header")
+
+        with self._lock:
+            self.validation_sensors_enabled = bool(enabled)
+            self.validation_sensor_active_high = bool(active_high)
+            self.validation_sensor_pull_up = bool(pull_up)
+            self.validation_sensor_pins = (
+                {
+                    "ROLL_PROX": roll_pin,
+                    "TILT_PROX": tilt_pin,
+                }
+                if self.validation_sensors_enabled
+                else {}
+            )
+            self.input_pins = {
+                **self.button_pins,
+                **self.home_switch_pins,
+                **self.validation_sensor_pins,
+            }
+            self._validation_sensor_states = {
+                name: False for name in self.validation_sensor_pins
+            }
+
+            if self.available and self.backend == "RPi.GPIO":
+                validation_pull_mode = self._validation_pull_mode()
+                reserved_pins = {
+                    *self.button_pins.values(),
+                    *self.home_switch_pins.values(),
+                }
+                for pin in self.validation_sensor_pins.values():
+                    if pin not in reserved_pins:
+                        GPIO.setup(pin, GPIO.IN, pull_up_down=validation_pull_mode)
+
+            try:
+                raw_states = self._read_input_raws()
+                self._validation_sensor_states = {
+                    name: self._decode_named_input(name, raw_states[name])
+                    for name in self.validation_sensor_pins
+                }
+            except Exception:
+                pass
+
+        return self.validation_input_summary()
+
     def _decode_input(self, raw_value: int) -> bool:
         return bool(raw_value) if self.button_active_high else not bool(raw_value)
 

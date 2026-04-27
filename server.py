@@ -2,8 +2,8 @@ import socket
 
 from controllers.actuator_controller import ActuatorController
 from controllers.clearcore_controller import ClearCoreController
-from utils.config_manager import load_config
-from utils.pi_gpio import PiGpioManager
+from utils.config_manager import load_config, save_config
+from utils.pi_gpio import BCM_TO_PHYSICAL_PIN, PiGpioManager
 from utils.serial_ports import get_serial_ports, probe_serial_port
 
 HOST = "0.0.0.0"
@@ -81,6 +81,7 @@ def is_actuator_command(cmd: str) -> bool:
         "CYCLE",
         "DIAG",
         "DIAGNOSTICS",
+        "SENSORS",
     }
 
 
@@ -96,6 +97,40 @@ def handle_gpio_command(cmd: str):
 
     if cmd == "GPIO_VALIDATION_INPUTS":
         return gpio.validation_input_summary()
+
+    if cmd.startswith("GPIO_CONFIG_VALIDATION_SENSORS:"):
+        payload = cmd.split(":", 1)[1]
+        parts = [part.strip() for part in payload.split(",")]
+        if len(parts) != 5:
+            return "ERR GPIO_CONFIG_VALIDATION_SENSORS"
+
+        try:
+            enabled = parts[0] == "1"
+            roll_pin = int(parts[1])
+            tilt_pin = int(parts[2])
+            active_high = parts[3] == "1"
+            pull_up = parts[4] == "1"
+        except ValueError:
+            return "ERR GPIO_CONFIG_VALIDATION_SENSORS invalid value"
+        if roll_pin == tilt_pin:
+            return "ERR GPIO_CONFIG_VALIDATION_SENSORS roll and tilt pins must differ"
+        if roll_pin not in BCM_TO_PHYSICAL_PIN or tilt_pin not in BCM_TO_PHYSICAL_PIN:
+            return "ERR GPIO_CONFIG_VALIDATION_SENSORS pin is not on the known 40-pin header"
+
+        gpio_config = config.setdefault("pi_gpio", {})
+        gpio_config["validation_sensors_enabled"] = enabled
+        gpio_config["roll_prox_pin"] = roll_pin
+        gpio_config["tilt_prox_pin"] = tilt_pin
+        gpio_config["validation_sensor_active_high"] = active_high
+        gpio_config["validation_sensor_pull_up"] = pull_up
+        save_config(config)
+        return gpio.configure_validation_sensors(
+            enabled,
+            roll_pin,
+            tilt_pin,
+            active_high,
+            pull_up,
+        )
 
     if cmd == "GPIO_TEST_LEDS":
         return gpio.test_leds()

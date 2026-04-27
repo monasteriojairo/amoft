@@ -27,6 +27,7 @@ class AutoTab(QWidget):
     command_signal = Signal(str)
     reconnect_signal = Signal()
     cycle_state_signal = Signal(str)
+    HOME_SWITCH_BACKOFF_MS = 500
 
     def __init__(self):
         super().__init__()
@@ -58,6 +59,7 @@ class AutoTab(QWidget):
         layout.addWidget(self.progress)
 
         self.refresh_action_options()
+        self.apply_step_option_defaults()
         self.update_step_option_controls()
         self.refresh_presets()
         self.update_button_states()
@@ -85,11 +87,17 @@ class AutoTab(QWidget):
         self.enable_before_check = QCheckBox("Enable Motor Before Step")
         self.stop_after_check = QCheckBox("Stop After Dwell")
         self.disable_after_check = QCheckBox("Disable Motor After Step")
+        self.tilt_home_switch_check = QCheckBox("Tilt retract until home switch")
+        self.tilt_home_switch_check.setToolTip(
+            "For M1 retract steps, stop when M1_HOME is hit. Dwell is used as the timeout."
+        )
+        self.tilt_home_switch_check.toggled.connect(lambda _: self.update_step_option_controls())
 
         self.add_step_btn = QPushButton("Add Step")
         self.update_step_btn = QPushButton("Update Selected")
 
         self.peripheral_combo.currentIndexChanged.connect(self.on_peripheral_changed)
+        self.action_combo.currentIndexChanged.connect(lambda _: self.update_step_option_controls())
         self.add_step_btn.clicked.connect(self.add_step)
         self.update_step_btn.clicked.connect(self.update_selected_step)
 
@@ -108,6 +116,7 @@ class AutoTab(QWidget):
         grid.addWidget(self.disable_after_check, 3, 0, 1, 2)
         grid.addWidget(self.add_step_btn, 3, 2)
         grid.addWidget(self.update_step_btn, 3, 3)
+        grid.addWidget(self.tilt_home_switch_check, 4, 0, 1, 4)
 
         return box
 
@@ -189,39 +198,66 @@ class AutoTab(QWidget):
         self.action_combo.clear()
 
         if current in {"m0", "m1"}:
-            self.action_combo.addItem("Forward", "forward")
-            self.action_combo.addItem("Reverse", "reverse")
+            self.action_combo.addItem("Extend", "forward")
+            self.action_combo.addItem("Retract", "reverse")
         else:
             self.action_combo.addItem("Extend", "extend")
             self.action_combo.addItem("Retract", "retract")
 
+    def action_display_text(self, peripheral: str, action: str, wait_for_home_switch=None):
+        if wait_for_home_switch:
+            return f"Retract until {wait_for_home_switch}_HOME"
+        if peripheral in {"m0", "m1"}:
+            if action == "forward":
+                return "Extend"
+            if action == "reverse":
+                return "Retract"
+        return action.replace("_", " ").title()
+
     def on_peripheral_changed(self):
         self.refresh_action_options()
+        self.apply_step_option_defaults()
         self.update_step_option_controls()
+
+    def apply_step_option_defaults(self):
+        peripheral = self.peripheral_combo.currentData()
+        if peripheral in {"m0", "m1"}:
+            self.enable_before_check.setChecked(True)
+            self.stop_after_check.setChecked(True)
+            self.disable_after_check.setChecked(True)
+        elif peripheral == "actuator":
+            self.enable_before_check.setChecked(True)
+            self.stop_after_check.setChecked(False)
+            self.disable_after_check.setChecked(True)
+        self.tilt_home_switch_check.setChecked(False)
+
+    def selected_step_supports_tilt_home_switch(self):
+        return (
+            self.peripheral_combo.currentData() == "m1"
+            and self.action_combo.currentData() == "reverse"
+        )
 
     def update_step_option_controls(self):
         peripheral = self.peripheral_combo.currentData()
         is_motor = peripheral in {"m0", "m1"}
         is_actuator = peripheral == "actuator"
+        supports_tilt_home_switch = self.selected_step_supports_tilt_home_switch()
 
         self.enable_before_check.setText("Enable Motor Before Step")
         self.stop_after_check.setText("Stop After Dwell")
         self.disable_after_check.setText("Disable Motor After Step")
 
-        if is_motor:
-            self.enable_before_check.setChecked(True)
-            self.stop_after_check.setChecked(True)
-            self.disable_after_check.setChecked(True)
-        elif is_actuator:
+        if is_actuator:
             self.enable_before_check.setText("Start Actuator Before Step")
             self.disable_after_check.setText("Stop Actuator After Step")
-            self.enable_before_check.setChecked(True)
-            self.stop_after_check.setChecked(False)
-            self.disable_after_check.setChecked(True)
 
-        self.enable_before_check.setEnabled(False if (is_motor or is_actuator) else True)
+        self.enable_before_check.setEnabled(is_motor)
         self.stop_after_check.setEnabled(not is_actuator)
-        self.disable_after_check.setEnabled(False if (is_motor or is_actuator) else True)
+        self.disable_after_check.setEnabled(is_motor)
+        self.tilt_home_switch_check.setEnabled(supports_tilt_home_switch)
+        if not supports_tilt_home_switch:
+            self.tilt_home_switch_check.setChecked(False)
+        self.dwell_spin.setEnabled(not self.tilt_home_switch_check.isChecked())
 
     def add_step(self):
         step = self.build_step_from_inputs()
@@ -250,20 +286,42 @@ class AutoTab(QWidget):
         dwell_s = self.dwell_spin.value()
         dwell_ms = int(dwell_s * 1000)
 
-        display = (
-            f"{self.peripheral_combo.currentText()} | "
-            f"{self.action_combo.currentText()} | "
-            f"{dwell_s:.1f}s | repeat {repeat}"
+        wait_for_home_switch = (
+            "M1"
+            if self.tilt_home_switch_check.isChecked()
+            and self.selected_step_supports_tilt_home_switch()
+            else None
         )
+        action_text = self.action_display_text(peripheral, action, wait_for_home_switch)
+        display_parts = [
+            self.peripheral_combo.currentText(),
+            action_text,
+        ]
+        if not wait_for_home_switch:
+            display_parts.append(f"{dwell_s:.1f}s")
+        display_parts.append(f"repeat {repeat}")
+
+        if peripheral in {"m0", "m1"}:
+            display_parts.append(
+                "enable before" if self.enable_before_check.isChecked() else "no enable"
+            )
+            display_parts.append(
+                "stop after" if self.stop_after_check.isChecked() else "no stop"
+            )
+            display_parts.append(
+                "disable after" if self.disable_after_check.isChecked() else "keep enabled"
+            )
+        display = " | ".join(display_parts)
 
         return {
             "peripheral": peripheral,
             "action": action,
             "repeat": repeat,
             "dwell_ms": dwell_ms,
-            "enable_before": True if peripheral in {"m0", "m1", "actuator"} else self.enable_before_check.isChecked(),
+            "enable_before": True if peripheral == "actuator" else self.enable_before_check.isChecked(),
             "stop_after": False if peripheral == "actuator" else self.stop_after_check.isChecked(),
-            "disable_after": True if peripheral in {"m0", "m1", "actuator"} else self.disable_after_check.isChecked(),
+            "disable_after": True if peripheral == "actuator" else self.disable_after_check.isChecked(),
+            "wait_for_home_switch": wait_for_home_switch,
             "display": display,
         }
 
@@ -279,10 +337,11 @@ class AutoTab(QWidget):
         self.action_combo.setCurrentIndex(self.action_combo.findData(step["action"]))
         self.repeat_spin.setValue(step["repeat"])
         self.dwell_spin.setValue(step["dwell_ms"] / 1000.0)
+        self.update_step_option_controls()
         self.enable_before_check.setChecked(step["enable_before"])
         self.stop_after_check.setChecked(step["stop_after"])
         self.disable_after_check.setChecked(step["disable_after"])
-        self.update_step_option_controls()
+        self.tilt_home_switch_check.setChecked(step.get("wait_for_home_switch") == "M1")
 
     def move_step_up(self):
         row = self.sequence_list.currentRow()
@@ -385,28 +444,51 @@ class AutoTab(QWidget):
                 self.preset_combo.setCurrentIndex(index)
 
     def normalize_loaded_step(self, step):
+        peripheral = step.get("peripheral", "m0")
+        is_motor = peripheral in {"m0", "m1"}
+        is_actuator = peripheral == "actuator"
+        enable_default = True if is_motor or is_actuator else False
+        stop_default = False if is_actuator else True
+        disable_default = True if is_motor or is_actuator else False
+
         normalized = {
-            "peripheral": step.get("peripheral", "m0"),
+            "peripheral": peripheral,
             "action": step.get("action", "forward"),
             "repeat": int(step.get("repeat", 1)),
             "dwell_ms": int(step.get("dwell_ms", 1000)),
-            "enable_before": bool(step.get("enable_before", False)),
-            "stop_after": bool(step.get("stop_after", True)),
-            "disable_after": bool(step.get("disable_after", False)),
+            "enable_before": bool(step.get("enable_before", enable_default)),
+            "stop_after": bool(step.get("stop_after", stop_default)),
+            "disable_after": bool(step.get("disable_after", disable_default)),
+            "wait_for_home_switch": step.get("wait_for_home_switch"),
         }
-        if normalized["peripheral"] in {"m0", "m1"}:
-            normalized["enable_before"] = True
-            normalized["stop_after"] = True
-            normalized["disable_after"] = True
-        elif normalized["peripheral"] == "actuator":
+        if is_actuator:
             normalized["enable_before"] = True
             normalized["stop_after"] = False
             normalized["disable_after"] = True
-        normalized["display"] = (
-            f"{normalized['peripheral'].upper()} | "
-            f"{normalized['action'].replace('_', ' ').title()} | "
-            f"{normalized['dwell_ms'] / 1000.0:.1f}s | repeat {normalized['repeat']}"
+            normalized["wait_for_home_switch"] = None
+        if not (
+            normalized["peripheral"] == "m1"
+            and normalized["action"] == "reverse"
+            and normalized["wait_for_home_switch"] == "M1"
+        ):
+            normalized["wait_for_home_switch"] = None
+        action_text = self.action_display_text(
+            normalized["peripheral"],
+            normalized["action"],
+            normalized["wait_for_home_switch"],
         )
+        display_parts = [
+            normalized["peripheral"].upper(),
+            action_text,
+        ]
+        if not normalized["wait_for_home_switch"]:
+            display_parts.append(f"{normalized['dwell_ms'] / 1000.0:.1f}s")
+        display_parts.append(f"repeat {normalized['repeat']}")
+        if is_motor:
+            display_parts.append("enable before" if normalized["enable_before"] else "no enable")
+            display_parts.append("stop after" if normalized["stop_after"] else "no stop")
+            display_parts.append("disable after" if normalized["disable_after"] else "keep enabled")
+        normalized["display"] = " | ".join(display_parts)
         return normalized
 
     def start_cycle(self):
@@ -501,17 +583,25 @@ class AutoTab(QWidget):
 
         if step["peripheral"] in {"m0", "m1"}:
             motor_name = step["peripheral"].upper()
-            entries.append({
-                "label": f"{label_prefix} | enable",
-                "command": f"ENABLE_{motor_name}",
-                "delay_ms": 250,
-            })
+            if step["enable_before"]:
+                entries.append({
+                    "label": f"{label_prefix} | enable",
+                    "command": f"ENABLE_{motor_name}",
+                    "delay_ms": 250,
+                })
 
-            entries.append({
+            move_entry = {
                 "label": label_prefix,
                 "command": self.command_for_step(step),
                 "delay_ms": step["dwell_ms"],
-            })
+            }
+            if step.get("wait_for_home_switch"):
+                move_entry["wait_for_home_switch"] = step["wait_for_home_switch"]
+                move_entry["home_switch_backoff_command"] = self.home_switch_backoff_command(
+                    step["wait_for_home_switch"]
+                )
+                move_entry["home_switch_backoff_ms"] = self.HOME_SWITCH_BACKOFF_MS
+            entries.append(move_entry)
 
             if step["stop_after"]:
                 entries.append({
@@ -520,11 +610,12 @@ class AutoTab(QWidget):
                     "delay_ms": 250,
                 })
 
-            entries.append({
-                "label": f"{label_prefix} | disable",
-                "command": f"DISABLE_{motor_name}",
-                "delay_ms": 0,
-            })
+            if step["disable_after"]:
+                entries.append({
+                    "label": f"{label_prefix} | disable",
+                    "command": f"DISABLE_{motor_name}",
+                    "delay_ms": 0,
+                })
             return entries
 
         entries.append({
@@ -550,6 +641,13 @@ class AutoTab(QWidget):
         if step["action"] == "extend":
             return "EXTEND"
         return "RETRACT"
+
+    def home_switch_backoff_command(self, motor_name: str):
+        if motor_name == "M1":
+            return "MOVE_POS1_M1"
+        if motor_name == "M0":
+            return "MOVE_POS1_M0"
+        return None
 
     def advance_sequence(self):
         if not self.is_running or self.is_paused:
@@ -611,6 +709,47 @@ class AutoTab(QWidget):
 
         self.update_button_states()
 
+    def handle_home_switch_stop(self, motor_name: str):
+        if not self.is_running or self.is_paused:
+            return
+        if self.current_step_index < 0 or self.current_step_index >= len(self.execution_steps):
+            return
+
+        active_step = self.execution_steps[self.current_step_index]
+        if active_step.get("wait_for_home_switch") != motor_name:
+            return
+
+        self.delay_timer.stop()
+        self.pending_delay_ms = 0
+        active_step["wait_for_home_switch"] = None
+        backoff_command = active_step.get("home_switch_backoff_command")
+        if backoff_command:
+            backoff_ms = int(active_step.get("home_switch_backoff_ms", self.HOME_SWITCH_BACKOFF_MS))
+            backoff_entry = {
+                "label": f"{active_step['label']} | back off {motor_name}_HOME",
+                "command": backoff_command,
+                "delay_ms": backoff_ms,
+            }
+            insert_entries = [backoff_entry]
+            next_index = self.current_step_index + 1
+            stop_command = f"STOP_{motor_name}"
+            if (
+                next_index >= len(self.execution_steps)
+                or self.execution_steps[next_index].get("command") != stop_command
+            ):
+                insert_entries.append({
+                    "label": f"{active_step['label']} | stop after home backoff",
+                    "command": stop_command,
+                    "delay_ms": 250,
+                })
+            self.execution_steps[next_index:next_index] = insert_entries
+            self.log_signal.emit(
+                f"Auto: {motor_name}_HOME reached; backing off switch for {backoff_ms / 1000.0:.1f}s"
+            )
+        else:
+            self.log_signal.emit(f"Auto: {motor_name}_HOME reached; continuing sequence")
+        QTimer.singleShot(0, self.advance_sequence)
+
     def pause_cycle(self):
         if not self.is_running or self.is_paused:
             return
@@ -638,7 +777,7 @@ class AutoTab(QWidget):
         else:
             self.advance_sequence()
 
-    def abort_cycle(self):
+    def abort_cycle(self, disable_motors: bool = True):
         if not self.is_running:
             self.log_signal.emit("Auto: Abort pressed")
             self.cycle_state_signal.emit("stopped")
@@ -647,9 +786,10 @@ class AutoTab(QWidget):
         self.delay_timer.stop()
         self.executing_command = None
         self.command_signal.emit("STOP_M0")
-        self.command_signal.emit("DISABLE_M0")
         self.command_signal.emit("STOP_M1")
-        self.command_signal.emit("DISABLE_M1")
+        if disable_motors:
+            self.command_signal.emit("DISABLE_M0")
+            self.command_signal.emit("DISABLE_M1")
         self.command_signal.emit("STOP_ACTUATOR")
 
         self.is_running = False
@@ -664,7 +804,7 @@ class AutoTab(QWidget):
         self.update_button_states()
 
     def abort_from_hardware(self):
-        self.abort_cycle()
+        self.abort_cycle(disable_motors=False)
 
     def request_reconnect(self):
         if self.is_running:
